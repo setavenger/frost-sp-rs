@@ -153,10 +153,10 @@ impl SpWallet {
         let mut candidates: Vec<(u32, XOnlyPublicKey)> = vec![];
         for (vout, o) in tx.output.iter().enumerate() {
             if is_p2tr(o.script_pubkey.as_bytes()) {
-                candidates.push((
-                    vout as u32,
-                    XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..])?,
-                ));
+                // An unspendable P2TR-shaped output (x not on the curve) is just not ours.
+                if let Ok(k) = XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..]) {
+                    candidates.push((vout as u32, k));
+                }
             }
         }
 

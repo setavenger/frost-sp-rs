@@ -8,7 +8,9 @@ use bitcoin::{Amount, ScriptBuf, TxOut};
 use common::*;
 use frost_secp256k1_tr as frost;
 use frost_sp_wallet::group::FrostGroup;
-use frost_sp_wallet::spend::{build_spend_tx, verify_consensus, SignRequest, Signer};
+use frost_sp_wallet::spend::{
+    build_spend_tx, verify_consensus, ApprovedSpend, SignRequest, Signer,
+};
 use frost_sp_wallet::wallet::{OwnedOutput, SpWallet};
 use frost_sp_wallet::Error;
 use secp256k1::{Scalar, Secp256k1};
@@ -26,6 +28,14 @@ struct World {
 impl World {
     fn labels(&self) -> Vec<u32> {
         self.owned.label.into_iter().filter(|m| *m != 0).collect()
+    }
+}
+
+fn approval(owned: &OwnedOutput, tx: &bitcoin::Transaction) -> ApprovedSpend {
+    ApprovedSpend {
+        outpoint: owned.outpoint,
+        outputs: tx.output.clone(),
+        max_fee: Amount::from_sat(1_000),
     }
 }
 
@@ -87,7 +97,7 @@ fn run_spend(w: &World, ids: [usize; 2], seed: u64) -> Result<bitcoin::Transacti
     let pkg = coord
         .signing_package(&tx, &funding_txo, commitments)
         .unwrap();
-    let approved = tx.output.clone();
+    let approved = approval(&w.owned, &tx);
     let mut shares = BTreeMap::new();
     for i in ids {
         let req = SignRequest {
@@ -203,9 +213,10 @@ fn session(w: &World, tx: bitcoin::Transaction, msg: Option<[u8; 32]>) -> Sessio
 }
 
 fn try_sign(w: &World, s: &mut Session, f: impl FnOnce(&mut SignRequest)) -> Result<(), Error> {
-    let approved = build_spend_tx(&w.owned, payout(), Amount::from_sat(1_000))
-        .unwrap()
-        .output;
+    let approved = approval(
+        &w.owned,
+        &build_spend_tx(&w.owned, payout(), Amount::from_sat(1_000)).unwrap(),
+    );
     let mut req = SignRequest {
         funding_tx: &w.funding.tx,
         funding_prevout_spks: &w.funding.prevout_spks,
@@ -346,4 +357,93 @@ fn consensus_check_is_not_vacuous() {
     assert!(verify_consensus(&good, &txo2).is_err());
     good.input[0].witness = bitcoin::Witness::new();
     assert!(verify_consensus(&good, &txo).is_err());
+}
+
+fn req_for<'a>(
+    w: &'a World,
+    tx: &'a bitcoin::Transaction,
+    pkg: &'a frost::SigningPackage,
+) -> SignRequest<'a> {
+    SignRequest {
+        funding_tx: &w.funding.tx,
+        funding_prevout_spks: &w.funding.prevout_spks,
+        funding_vout: w.owned.outpoint.vout,
+        spend_tx: tx,
+        signing_package: pkg,
+        coordinator_tau_hint: None,
+    }
+}
+
+#[test]
+fn refuses_excess_fee_and_wrong_coin() {
+    let w = world(31, None, &[InputKind::P2wpkh]);
+    // fee 50_000 > approved ceiling 1_000, outputs equal to what the coordinator built
+    let greedy = build_spend_tx(&w.owned, payout(), Amount::from_sat(50_000)).unwrap();
+    let mut s = session(&w, greedy.clone(), None);
+    let approved = approval(&w.owned, &greedy);
+    let req = req_for(&w, &greedy, &s.pkg);
+    assert_refused(
+        s.signers[0].sign(&req, &approved).map(|_| ()),
+        "fee exceeds",
+    );
+
+    // approved coin differs from the funding output being spent
+    let tx = build_spend_tx(&w.owned, payout(), Amount::from_sat(1_000)).unwrap();
+    let mut s = session(&w, tx.clone(), None);
+    let mut approved = approval(&w.owned, &tx);
+    approved.outpoint.vout += 1;
+    let req = req_for(&w, &tx, &s.pkg);
+    assert_refused(
+        s.signers[0].sign(&req, &approved).map(|_| ()),
+        "approved coin",
+    );
+}
+
+#[test]
+fn finalize_rejects_a_different_transaction() {
+    let w = world(32, None, &[InputKind::P2wpkh]);
+    let tx = build_spend_tx(&w.owned, payout(), Amount::from_sat(1_000)).unwrap();
+    let coord = coordinator(&w.group);
+    let mut signers = make_signers(&w.group, NET, &[]);
+    let funding_txo = w.funding.tx.output[w.owned.outpoint.vout as usize].clone();
+    let mut r = rng(3);
+    let mut c = BTreeMap::new();
+    for i in [0usize, 1] {
+        c.insert(signers[i].identifier(), signers[i].commit(&mut r));
+    }
+    let pkg = coord.signing_package(&tx, &funding_txo, c).unwrap();
+    let approved = approval(&w.owned, &tx);
+    let mut shares = BTreeMap::new();
+    for i in [0usize, 1] {
+        let req = req_for(&w, &tx, &pkg);
+        shares.insert(
+            signers[i].identifier(),
+            signers[i].sign(&req, &approved).unwrap(),
+        );
+    }
+    let mut other = tx.clone();
+    other.output[0].value = Amount::from_sat(1);
+    assert!(coord.finalize(&other, &w.owned, &pkg, &shares).is_err());
+    assert!(coord.finalize(&tx, &w.owned, &pkg, &shares).is_ok());
+}
+
+#[test]
+fn invalid_p2tr_shaped_output_does_not_block_scanning() {
+    let mut w = world(33, None, &[InputKind::P2wpkh]);
+    // unrelated P2TR-shaped output whose x is not on the curve (32 x 0xff)
+    let mut spk = vec![0x51, 0x20];
+    spk.extend([0xffu8; 32]);
+    w.funding.tx.output.insert(
+        0,
+        TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        },
+    );
+    let wallet = SpWallet::new(sk_from_seed(33, "scan"), w.group.b_spend().unwrap(), NET).unwrap();
+    let owned = wallet
+        .scan_tx(&w.funding.tx, &w.funding.prevout_spks)
+        .unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].outpoint.vout, 1);
 }

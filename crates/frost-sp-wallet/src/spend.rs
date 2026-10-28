@@ -73,6 +73,13 @@ pub struct SignRequest<'a> {
     pub coordinator_tau_hint: Option<[u8; 32]>,
 }
 
+/// What a signer approved out of band: the exact coin, the exact outputs and a fee ceiling.
+pub struct ApprovedSpend {
+    pub outpoint: OutPoint,
+    pub outputs: Vec<TxOut>,
+    pub max_fee: Amount,
+}
+
 pub struct Signer {
     name: String,
     key_package: KeyPackage,
@@ -117,12 +124,8 @@ impl Signer {
     }
 
     /// Round 2. Nonces are consumed first, so a refused session cannot be retried with them.
-    /// `approved_outputs` are the exact outputs this signer agreed to (out of band).
-    pub fn sign(
-        &mut self,
-        req: &SignRequest,
-        approved_outputs: &[TxOut],
-    ) -> Result<SignatureShare> {
+    /// `approved` is what this signer agreed to out of band (coin, outputs, fee ceiling).
+    pub fn sign(&mut self, req: &SignRequest, approved: &ApprovedSpend) -> Result<SignatureShare> {
         let nonces = match self.nonces.take() {
             Some(n) => n,
             None => return self.refuse("no pending nonces (commit first)"),
@@ -161,8 +164,16 @@ impl Signer {
         if req.spend_tx.input[0].previous_output != want {
             return self.refuse("spend does not consume the funding output");
         }
-        if req.spend_tx.output.as_slice() != approved_outputs {
+        if want != approved.outpoint {
+            return self.refuse("funding output is not the approved coin");
+        }
+        if req.spend_tx.output.as_slice() != approved.outputs.as_slice() {
             return self.refuse("outputs differ from the approved outputs");
+        }
+        let out_sum: u64 = req.spend_tx.output.iter().map(|o| o.value.to_sat()).sum();
+        match funding_txo.value.to_sat().checked_sub(out_sum) {
+            Some(fee) if fee <= approved.max_fee.to_sat() => {}
+            _ => return self.refuse("fee exceeds the approved maximum"),
         }
 
         // 4. FROST message must be the sighash of the tx we just verified.
@@ -203,6 +214,21 @@ impl Coordinator {
         signing_package: &SigningPackage,
         shares: &BTreeMap<Identifier, SignatureShare>,
     ) -> Result<Transaction> {
+        // The returned tx must be the one the shares were produced for.
+        if spend_tx.input.len() != 1 || spend_tx.input[0].previous_output != owned.outpoint {
+            return Err(Error::Other(
+                "spend tx does not consume the owned output".into(),
+            ));
+        }
+        let prevout = TxOut {
+            value: owned.value,
+            script_pubkey: owned.script_pubkey.clone(),
+        };
+        if key_path_sighash(spend_tx, &prevout)?.as_slice() != signing_package.message() {
+            return Err(Error::Other(
+                "spend tx does not match the signing package message".into(),
+            ));
+        }
         let pkp = tweak_public_key_package(&self.public_key_package, &owned.tau)?;
         let sig = frost_secp256k1_tr::aggregate(signing_package, shares, &pkp)?;
         let bytes = sig.serialize()?;
