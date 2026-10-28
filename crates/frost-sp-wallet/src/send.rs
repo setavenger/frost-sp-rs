@@ -840,8 +840,15 @@ impl Signer {
                 return self.refuse(format!("output {i} amount differs from the approved one"));
             }
         }
-        let in_sum: u64 = resolved.iter().map(|r| r.txout.value.to_sat()).sum();
-        let out_sum: u64 = req.tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let sum = |vals: Vec<u64>| {
+            vals.into_iter().try_fold(0u64, |a, v| a.checked_add(v)).filter(|s| *s <= MAX_MONEY_SATS)
+        };
+        let (Some(in_sum), Some(out_sum)) = (
+            sum(resolved.iter().map(|r| r.txout.value.to_sat()).collect()),
+            sum(req.tx.output.iter().map(|o| o.value.to_sat()).collect()),
+        ) else {
+            return self.refuse("amounts are outside the monetary range");
+        };
         match in_sum.checked_sub(out_sum) {
             Some(fee) if fee <= approved.max_fee.to_sat() => {}
             _ => return self.refuse("fee exceeds the approved maximum"),
@@ -1226,11 +1233,32 @@ pub fn plan_spend_exact(
     }
     check_parity_guard(&resolved.iter().map(|r| r.g).collect::<Vec<_>>())?;
 
-    let have: u64 = coins.iter().map(|c| c.value.to_sat()).sum();
-    let target: u64 = payments.iter().map(|p| p.amount.to_sat()).sum();
+    // Monetary validation before anything is signed: positive amounts inside the monetary
+    // range, and every sum and product checked (a wrapped sum would sign a negative output).
+    let money = |sum: Option<u64>, what: &str| -> Result<u64> {
+        sum.filter(|v| *v <= MAX_MONEY_SATS)
+            .ok_or_else(|| Error::Other(format!("{what} is outside the monetary range")))
+    };
+    if payments.iter().any(|p| p.amount.to_sat() == 0) {
+        return Err(Error::Other("a payment of 0 sats".into()));
+    }
+    let have = money(
+        coins.iter().try_fold(0u64, |a, c| a.checked_add(c.value.to_sat())),
+        "the coins' value",
+    )?;
+    let target = money(
+        payments.iter().try_fold(0u64, |a, p| a.checked_add(p.amount.to_sat())),
+        "the payments' sum",
+    )?;
+    let fee_for = |n_out_lens: &[usize]| -> Result<u64> {
+        fee_rate_sat_vb
+            .checked_mul(est_vsize(coins.len(), n_out_lens))
+            .filter(|f| *f <= MAX_MONEY_SATS)
+            .ok_or_else(|| Error::Other("fee rate is outside any sane range".into()))
+    };
     let mut lens: Vec<usize> = payments.iter().map(|p| script_len_of(&p.dest)).collect();
-    let fee_no_change = fee_rate_sat_vb * est_vsize(coins.len(), &lens);
-    if have < target + fee_no_change {
+    let fee_no_change = fee_for(&lens)?;
+    if have < target.saturating_add(fee_no_change) {
         return Err(Error::Other(format!(
             "insufficient funds: coins hold {have} sats, payments {target} plus fee {fee_no_change}"
         )));
@@ -1248,9 +1276,9 @@ pub fn plan_spend_exact(
     let mut fee = have - target;
     if let Some(change) = change {
         lens.push(script_len_of(change));
-        let fee_with_change = fee_rate_sat_vb * est_vsize(coins.len(), &lens);
-        let amount = have.saturating_sub(target + fee_with_change);
-        if amount >= DUST_CHANGE_SATS {
+        let fee_with_change = fee_for(&lens)?;
+        let amount = have.saturating_sub(target.saturating_add(fee_with_change));
+        if amount >= dust_threshold(change) {
             outputs.push(ApprovedOutput {
                 dest: match change {
                     PaymentDest::Sp(c) => ApprovedDest::sp(c),
@@ -1261,7 +1289,7 @@ pub fn plan_spend_exact(
             fee = fee_with_change;
         }
     }
-    if fee > fee_no_change.max(1) * MAX_BURN_FACTOR {
+    if fee > fee_no_change.max(1).saturating_mul(MAX_BURN_FACTOR) {
         return Err(Error::Other(format!(
             "the leftover {fee} sats would all go to fees (about {fee_no_change} needed); declare a change address"
         )));
@@ -1275,6 +1303,18 @@ pub fn plan_spend_exact(
         coins: coins.to_vec(),
         fee: Amount::from_sat(fee),
     })
+}
+
+/// 21 million BTC in sats.
+pub const MAX_MONEY_SATS: u64 = 2_100_000_000_000_000;
+
+/// Smallest change output worth creating for this destination: the relay dust threshold of
+/// its script (an SP output is P2TR).
+fn dust_threshold(dest: &PaymentDest) -> u64 {
+    match dest {
+        PaymentDest::Sp(_) => DUST_CHANGE_SATS,
+        PaymentDest::Script(s) => s.minimal_non_dust().to_sat(),
+    }
 }
 
 /// A plan without change may leave at most this many times the estimated fee unspent.

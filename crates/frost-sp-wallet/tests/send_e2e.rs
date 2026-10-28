@@ -5,6 +5,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
+use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Transaction};
 use common::*;
 use frost_secp256k1_tr as frost;
@@ -897,4 +898,35 @@ fn spend_exact_round_trips_through_the_signers() {
     let mine = a.coord.wallet().scan_tx(&tx, &spks).unwrap();
     assert_eq!(mine.len(), 1);
     assert_eq!(mine[0].label, Some(0));
+}
+
+#[test]
+fn spend_exact_rejects_wrapping_amounts_zero_payments_and_absurd_fee_rates() {
+    let a = env(27, &[]);
+    let c = SpdkReceiver::new(28);
+    let coins = fund_coins(&a, &[1], None, 1100, 100_000);
+    let change = PaymentDest::Sp(a.coord.wallet().change_address());
+    let w = a.coord.wallet();
+    // 2^64 - 90000 plus 100000 wraps to 10000 in unchecked arithmetic.
+    let wrap = vec![pay_sp(&c.code(), u64::MAX - 89_999), pay_sp(&c.code(), 100_000)];
+    assert!(plan_spend_exact(w, &coins, &wrap, Some(&change), 5).is_err());
+    let zero = vec![pay_sp(&c.code(), 0)];
+    assert!(plan_spend_exact(w, &coins, &zero, Some(&change), 5).unwrap_err().to_string().contains("0 sats"));
+    let one = vec![pay_sp(&c.code(), 1_000)];
+    assert!(plan_spend_exact(w, &coins, &one, Some(&change), u64::MAX / 100).is_err());
+}
+
+#[test]
+fn spend_exact_uses_the_dust_threshold_of_the_change_script() {
+    let a = env(29, &[]);
+    let c = SpdkReceiver::new(30);
+    let coins = fund_coins(&a, &[1], None, 1200, 100_000);
+    let w = a.coord.wallet();
+    let p2pkh = ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_raw_hash(bitcoin::hashes::hash160::Hash::from_byte_array([9u8; 20])));
+    // Leaves roughly 400 sats of change: fine for P2TR (330), dust for P2PKH (546).
+    let pay = vec![pay_sp(&c.code(), 98_875)];
+    let sp = plan_spend_exact(w, &coins, &pay, Some(&PaymentDest::Sp(w.change_address())), 5).unwrap();
+    assert_eq!(sp.approved.outputs.len(), 2);
+    let pk = plan_spend_exact(w, &coins, &pay, Some(&PaymentDest::Script(p2pkh)), 5).unwrap();
+    assert_eq!(pk.approved.outputs.len(), 1, "sub-dust P2PKH change goes to fee");
 }

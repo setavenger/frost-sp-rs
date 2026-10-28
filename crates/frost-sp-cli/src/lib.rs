@@ -303,6 +303,11 @@ pub fn sign_request<R: RngCore + CryptoRng>(
 
 fn parse_dest(address: &str, net: bitcoin::Network) -> Result<PaymentDest, String> {
     if let Ok(code) = SilentPaymentCode::try_from(address) {
+        // `tsp` serves testnet, signet and regtest alike; `sp` only mainnet.
+        let want = if net == bitcoin::Network::Bitcoin { SpNetwork::Mainnet } else { SpNetwork::Testnet };
+        if code.network() != want {
+            return Err(format!("destination {address:?}: silent payment address is for another network"));
+        }
         return Ok(PaymentDest::Sp(code));
     }
     let a = Address::from_str(address)

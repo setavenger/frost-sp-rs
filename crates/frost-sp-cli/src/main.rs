@@ -90,7 +90,20 @@ fn dealer(args: &[String]) -> Result<String, String> {
     impl rand::CryptoRng for Dyn<'_> {}
     let (state, printed) = deal(max, min, scan, flag(args, "--print-group-secret")?.is_some(), &mut Dyn(rng.as_mut()))?;
     let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-    std::fs::write(&out, json + "\n").map_err(|e| format!("{out}: {e}"))?;
+    // The file holds every signing share: owner-only, and never widen an existing file.
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&out)
+            .map_err(|e| format!("{out}: {e}"))?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(|e| format!("{out}: {e}"))?;
+        f.write_all((json + "\n").as_bytes()).map_err(|e| format!("{out}: {e}"))?;
+    }
     serde_json::to_string_pretty(&printed).map_err(|e| e.to_string())
 }
 

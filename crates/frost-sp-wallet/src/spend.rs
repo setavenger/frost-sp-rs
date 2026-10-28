@@ -242,7 +242,14 @@ impl Signer {
         if req.spend_tx.output.as_slice() != approved.outputs.as_slice() {
             return self.refuse("outputs differ from the approved outputs");
         }
-        let out_sum: u64 = req.spend_tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let Some(out_sum) = req
+            .spend_tx
+            .output
+            .iter()
+            .try_fold(0u64, |a, o| a.checked_add(o.value.to_sat()))
+        else {
+            return self.refuse("amounts are outside the monetary range");
+        };
         match funding_txo.value.to_sat().checked_sub(out_sum) {
             Some(fee) if fee <= approved.max_fee.to_sat() => {}
             _ => return self.refuse("fee exceeds the approved maximum"),

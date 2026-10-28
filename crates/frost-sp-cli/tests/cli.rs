@@ -241,3 +241,46 @@ fn the_fixture_wallet_has_the_address_the_testkit_pins() {
         "02f02de90269e60c64730cdce688978416626b012d528c2ae40372463a6771b7c8"
     );
 }
+
+#[test]
+fn refuses_a_mainnet_silent_payment_address_on_regtest() {
+    let w = wallet(&[]);
+    let cs = coins(&w, &[1], 2100);
+    let bob = SpdkReceiver::new(46);
+    let c = bob.code();
+    let mainnet = silentpayments::SilentPaymentCode::new_v0(c.scan_key(), c.m_pubkey(), Network::Mainnet).to_string();
+    let (v, ok) = run(&["--state", STATE], &wallet_env(""), &request(&cs, &[(mainnet.clone(), 10_000)], &tsp(&w.change_address())));
+    assert!(!ok && v["error"].as_str().unwrap().contains("another network"), "{v}");
+    let (v, ok) = run(&["--state", STATE], &wallet_env(""), &request(&cs, &[(tsp(&c), 10_000)], &mainnet));
+    assert!(!ok && v["error"].as_str().unwrap().contains("another network"), "{v}");
+}
+
+#[test]
+fn refuses_wrapping_and_zero_amounts_with_an_error_document() {
+    let w = wallet(&[]);
+    let cs = coins(&w, &[1], 2500);
+    let bob = SpdkReceiver::new(47);
+    let a = tsp(&bob.code());
+    let (v, ok) = run(
+        &["--state", STATE],
+        &wallet_env(""),
+        &request(&cs, &[(a.clone(), 18446744073709461616), (a.clone(), 100_000)], &tsp(&w.change_address())),
+    );
+    assert!(!ok && v["error"].as_str().unwrap().contains("monetary range"), "{v}");
+    let (v, ok) = run(&["--state", STATE], &wallet_env(""), &request(&cs, &[(a, 0)], &tsp(&w.change_address())));
+    assert!(!ok && v["error"].as_str().unwrap().contains("0 sats"), "{v}");
+}
+
+#[test]
+fn the_dealer_state_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("frost-sp-perm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.json");
+    std::fs::write(&path, "old").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let (_, ok) = run(&["dealer", "--out", path.to_str().unwrap(), "--seed", "3"], &[], "");
+    assert!(ok);
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
