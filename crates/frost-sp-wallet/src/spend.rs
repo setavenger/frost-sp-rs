@@ -90,8 +90,6 @@ pub struct Signer {
     /// One nonce pair per input of the pending multi-input send (see `send.rs`).
     pub(crate) send_nonces: Vec<SigningNonces>,
     pub(crate) exposure: ExposureCounter,
-    /// Shares were released in this send session and it has not completed.
-    pub(crate) ecdh_pending: bool,
 }
 
 impl Signer {
@@ -103,6 +101,10 @@ impl Signer {
                 "wallet B_spend is not the group key of this key package".into(),
             ));
         }
+        let wallet_group_key: [u8; 33] = x
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Other("group key is not 33 bytes".into()))?;
         Ok(Self {
             name: name.into(),
             key_package,
@@ -110,8 +112,8 @@ impl Signer {
             public_key_package: None,
             nonces: None,
             send_nonces: vec![],
-            exposure: ExposureCounter::new(RotationThreshold::Thousand),
-            ecdh_pending: false,
+            exposure: ExposureCounter::new(RotationThreshold::Thousand)
+                .with_group_key(wallet_group_key),
         })
     }
 

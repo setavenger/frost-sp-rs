@@ -180,10 +180,10 @@ impl SenderContext {
             .map(|t| outpoint_bytes(&t.outpoint))
             .min()
             .ok_or_else(|| Error::Other("no inputs".into()))?;
-        let input_hash = scalar_from_be(&tagged_hash(
+        let input_hash = nonzero_input_hash(scalar_from_be(&tagged_hash(
             "BIP0352/Inputs",
             &[&min_op, &a_pub.serialize()],
-        ))?;
+        ))?)?;
         Ok(Self {
             sum_g,
             sum_g_tau,
@@ -439,8 +439,56 @@ pub fn key_path_sighashes(tx: &Transaction, prevouts: &[TxOut]) -> Result<Vec<[u
         .collect()
 }
 
+/// BIP 352: `input_hash = 0` must fail (negligible probability, but required).
+fn nonzero_input_hash(h: Scalar) -> Result<Scalar> {
+    if bool::from(h.is_zero()) {
+        return Err(Error::Scalar("input_hash is zero"));
+    }
+    Ok(h)
+}
+
+/// Check the public key package before any `D_j`/DLEQ is accepted or anything is signed:
+/// its group key is ours, our own `X_i` is our key package's verifying share, and
+/// `sum_{i in S} lambda_i*X_i == X` for the actual signing set. With this, the DLEQ proofs
+/// against each `X_i` force `sum lambda_i*D_i = x*B` whatever a substituted `X_j'` claims.
+pub fn validate_public_key_package(
+    pkp: &PublicKeyPackage,
+    key_package: &KeyPackage,
+    signing_set: &[Identifier],
+) -> Result<()> {
+    let bad = |m: &str| Error::Other(format!("public key package invalid: {m}"));
+    let x = pkp.verifying_key().serialize()?;
+    if x != key_package.verifying_key().serialize()? {
+        return Err(bad("group key differs from this signer's key package"));
+    }
+    let own = pkp
+        .verifying_shares()
+        .get(key_package.identifier())
+        .ok_or_else(|| bad("no verifying share for this signer"))?;
+    if own.serialize()? != key_package.verifying_share().serialize()? {
+        return Err(bad("own verifying share differs from this signer's key package"));
+    }
+    let lambdas = lagrange_at_zero(signing_set)?;
+    let mut sum = ProjectivePoint::IDENTITY;
+    for id in signing_set {
+        let x_i = pkp
+            .verifying_shares()
+            .get(id)
+            .ok_or_else(|| bad("signing set member has no verifying share"))?;
+        sum += to_k(&PublicKey::from_slice(&x_i.serialize()?)?)? * lambdas[id];
+    }
+    if from_k(&sum).ok() != PublicKey::from_slice(&x).ok() {
+        return Err(bad("sum of lambda_i*X_i over the signing set is not the group key"));
+    }
+    Ok(())
+}
+
 /// Verify every ECDH share (BIP 374, against the untweaked `X_i`) and derive the ECDH value of
 /// each distinct scan key among the SP outputs. Names the culprit on any failure.
+///
+/// Culprit ids are unauthenticated: `EcdhShare.id` is self-declared, so when shares are
+/// relayed by a coordinator the named culprit is only meaningful over authenticated channels
+/// (a relay can attach a bad proof to an honest id or drop an honest share).
 ///
 /// `own_scan`: the wallet's `b_scan`; outputs to that scan key use `b_scan*A`, not shares.
 pub fn ecdh_for_outputs(
@@ -655,11 +703,6 @@ impl Signer {
         approved: &ApprovedSend,
         rng: &mut R,
     ) -> Result<Vec<EcdhShare>> {
-        // A previous session that released shares and never completed counts as aborted.
-        if self.ecdh_pending {
-            self.exposure.record_abort();
-            self.ecdh_pending = false;
-        }
         self.check_inputs(req.inputs, approved)?;
         let own = self.own_scan_pub();
         let approved_keys: BTreeSet<[u8; 33]> = approved
@@ -691,29 +734,19 @@ impl Signer {
             .iter()
             .map(|k| make_ecdh_share(&self.key_package, k, rng))
             .collect::<Result<Vec<_>>>()?;
-        if !shares.is_empty() {
-            self.exposure.record_release(&keys);
-            self.ecdh_pending = true;
-        }
+        self.exposure.record_release(&keys);
         Ok(shares)
     }
 
     /// Round B. Nonces are taken out of the signer first, so a refused session cannot reuse
-    /// them. A refusal after shares were released counts as an aborted session.
+    /// them. Aborted sessions cost nothing in the exposure counter (see `exposure.rs`).
     pub fn sign_send(
         &mut self,
         req: &SendSignRequest,
         approved: &ApprovedSend,
     ) -> Result<Vec<SignatureShare>> {
         let nonces = std::mem::take(&mut self.send_nonces);
-        let r = self.sign_send_inner(req, approved, nonces);
-        if self.ecdh_pending {
-            if r.is_err() {
-                self.exposure.record_abort();
-            }
-            self.ecdh_pending = false;
-        }
-        r
+        self.sign_send_inner(req, approved, nonces)
     }
 
     fn sign_send_inner(
@@ -768,6 +801,10 @@ impl Signer {
             || !set.contains(self.key_package.identifier())
         {
             return self.refuse("signing set is too small or does not include this signer");
+        }
+
+        if let Err(e) = validate_public_key_package(pkp, &self.key_package, &set) {
+            return self.refuse(e.to_string());
         }
 
         // 3. Outputs: DLEQ proofs, recompute every SP output, amounts, fee.
@@ -903,6 +940,7 @@ impl SendCoordinator {
         let scripts = derive_scripts(outputs, &ecdh)?;
         Ok(Transaction {
             version: transaction::Version::TWO,
+            // Privacy fingerprint (review F4, accepted for the PoC): locktime is always 0.
             lock_time: absolute::LockTime::ZERO,
             input: resolved
                 .iter()
@@ -1125,6 +1163,7 @@ pub fn plan_send(
                 })
                 .collect();
             let fee = if change >= DUST_CHANGE_SATS {
+                // Privacy fingerprint (review F4, accepted for the PoC): change is always last.
                 outputs.push(ApprovedOutput {
                     dest: ApprovedDest::sp(&wallet.change_address()),
                     amount: Amount::from_sat(change),
@@ -1199,4 +1238,15 @@ pub fn send_payment<R: RngCore + CryptoRng>(
     let plan = plan_send(coordinator.wallet(), coins, payments, fee_rate_sat_vb)?;
     let tx = execute_send(coordinator, signers, signing_set, &plan, rng)?;
     Ok((tx, plan))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_hash_zero_is_rejected() {
+        assert!(nonzero_input_hash(Scalar::ZERO).is_err());
+        assert!(nonzero_input_hash(Scalar::ONE).is_ok());
+    }
 }
