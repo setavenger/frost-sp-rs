@@ -215,7 +215,9 @@ pub fn make_signers(group: &FrostGroup, net: Network, labels: &[u32]) -> Vec<Sig
             for m in labels {
                 wallet.add_label(*m).unwrap();
             }
-            Signer::new(format!("signer{}", i + 1), kp.clone(), wallet).unwrap()
+            Signer::new(format!("signer{}", i + 1), kp.clone(), wallet)
+                .unwrap()
+                .with_public_key_package(group.public_key_package.clone())
         })
         .collect()
 }
@@ -264,3 +266,144 @@ pub fn verify_bip340(sig: &[u8; 64], msg: &[u8; 32], xonly: &XOnlyPublicKey) -> 
 }
 
 pub fn keypair_unused(_: &Keypair) {}
+
+
+// ---------------------------------------------------------------------------------------
+// W2 helpers: whole-wallet environments, funded coins, a single-key spdk receiver
+// ---------------------------------------------------------------------------------------
+
+use frost_sp_wallet::send::{InputSource, SendCoordinator, SpendableCoin};
+use silentpayments::receiving::{Label, Receiver};
+use silentpayments::utils::receiving::{get_pubkey_from_input, PublicTweakData};
+use silentpayments::{SpVersion, TransactionInputs, TransactionSharedSecret};
+
+pub struct Env {
+    pub group: FrostGroup,
+    pub signers: Vec<Signer>,
+    pub coord: SendCoordinator,
+    pub labels: Vec<u32>,
+}
+
+pub fn env(seed: u64, labels: &[u32]) -> Env {
+    let group = FrostGroup::trusted_dealer(3, 2, sk_from_seed(seed, "scan"), &mut rng(seed)).unwrap();
+    let signers = make_signers(&group, Network::Regtest, labels);
+    let mut w = SpWallet::new(group.b_scan, group.b_spend().unwrap(), Network::Regtest).unwrap();
+    for m in labels {
+        w.add_label(*m).unwrap();
+    }
+    let coord = SendCoordinator::new(group.public_key_package.clone(), w);
+    Env {
+        group,
+        signers,
+        coord,
+        labels: labels.to_vec(),
+    }
+}
+
+pub fn ident(i: u16) -> frost::Identifier {
+    frost::Identifier::try_from(i).unwrap()
+}
+
+impl Env {
+    pub fn address(&self, label: Option<u32>) -> silentpayments::SilentPaymentCode {
+        self.coord.wallet().address(label).unwrap()
+    }
+}
+
+/// Coins paid to `env` (unlabelled or `label`) by an independent test sender. `parities[i]`
+/// is the wanted `g` (+1 even / -1 odd) of coin `i`, found by trying funding seeds.
+pub fn fund_coins(env: &Env, parities: &[i8], label: Option<u32>, seed0: u64, value: u64) -> Vec<SpendableCoin> {
+    let code = env.address(label);
+    let mut out = vec![];
+    let mut s = seed0;
+    for want in parities {
+        loop {
+            s += 1;
+            let kind = if s.is_multiple_of(2) { InputKind::P2tr } else { InputKind::P2wpkh };
+            let f = sp_fund(
+                &[FundingInput::new(s, kind)],
+                &[(code.scan_key(), code.m_pubkey())],
+                &[None],
+                value,
+            );
+            let src = InputSource {
+                funding_tx: f.tx,
+                funding_prevout_spks: f.prevout_spks,
+                funding_vout: 0,
+            };
+            let r = frost_sp_wallet::send::resolve_input(env.coord.wallet(), &src).unwrap();
+            if r.g == *want {
+                out.push(SpendableCoin { source: src, value: Amount::from_sat(value) });
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Ordinary single-key silent payment receiver (spdk), as a payee that is not a FROST wallet.
+pub struct SpdkReceiver {
+    pub scan: SecretKey,
+    pub spend: SecretKey,
+    pub receiver: Receiver,
+}
+
+impl SpdkReceiver {
+    pub fn new(seed: u64) -> Self {
+        let secp = Secp256k1::new();
+        let scan = sk_from_seed(seed, "c-scan");
+        let spend = sk_from_seed(seed, "c-spend");
+        let receiver = Receiver::new(
+            SpVersion::ZERO,
+            scan.public_key(&secp),
+            spend.public_key(&secp),
+            Label::new(scan, 0),
+            Network::Regtest,
+        )
+        .unwrap();
+        Self { scan, spend, receiver }
+    }
+
+    pub fn code(&self) -> silentpayments::SilentPaymentCode {
+        self.receiver.receiving_code()
+    }
+
+    /// x-only output keys of `tx` that belong to this receiver, found with spdk's scanner.
+    pub fn scan(&self, tx: &Transaction, prevout_spks: &[ScriptBuf]) -> Vec<XOnlyPublicKey> {
+        let secp = Secp256k1::new();
+        let mut inputs = TransactionInputs::new();
+        for (txin, spk) in tx.input.iter().zip(prevout_spks) {
+            let pk = get_pubkey_from_input(txin.script_sig.as_bytes(), &txin.witness.to_vec(), spk.as_bytes()).unwrap();
+            let op = silentpayments::utils::OutPoint::from_txid_bytes_and_vout(
+                txin.previous_output.txid.to_byte_array(),
+                txin.previous_output.vout,
+            );
+            inputs.push(op, spk.to_bytes(), pk);
+        }
+        let tweak = PublicTweakData::new(&secp, &inputs).unwrap();
+        let ss = TransactionSharedSecret::new_from_public_tweak_data(&secp, &tweak, &self.scan).unwrap();
+        let cands: Vec<XOnlyPublicKey> = tx
+            .output
+            .iter()
+            .filter(|o| o.script_pubkey.is_p2tr())
+            .map(|o| XOnlyPublicKey::from_slice(&o.script_pubkey.as_bytes()[2..]).unwrap())
+            .collect();
+        let found = self.receiver.scan_transaction(&ss, &cands).unwrap();
+        found.values().flat_map(|m| m.keys().copied()).collect()
+    }
+}
+
+pub fn prevout_spks_of(coins: &[SpendableCoin]) -> Vec<ScriptBuf> {
+    coins
+        .iter()
+        .map(|c| c.source.funding_tx.output[c.source.funding_vout as usize].script_pubkey.clone())
+        .collect()
+}
+
+/// The coin that an output of `tx` becomes once it is confirmed (funding data for the next spend).
+pub fn coin_from(tx: &Transaction, spks: &[ScriptBuf], vout: u32) -> SpendableCoin {
+    SpendableCoin {
+        source: InputSource { funding_tx: tx.clone(), funding_prevout_spks: spks.to_vec(), funding_vout: vout },
+        value: tx.output[vout as usize].value,
+    }
+}

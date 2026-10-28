@@ -1833,6 +1833,7 @@ dependencies = [
  "hex",
  "k256",
  "rand 0.8.8",
+ "rust-dleq",
  "secp256k1 0.29.1",
  "serde",
  "serde_json",

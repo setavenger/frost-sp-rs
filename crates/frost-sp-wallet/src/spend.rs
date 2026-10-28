@@ -20,6 +20,7 @@ use frost_secp256k1_tr::{Identifier, SigningPackage};
 use rand::{CryptoRng, RngCore};
 use secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
 
+use crate::exposure::{ExposureCounter, RotationThreshold};
 use crate::tweak::{tweak_key_package, tweak_public_key_package};
 use crate::wallet::{OwnedOutput, SpWallet};
 use crate::{Error, Result};
@@ -81,10 +82,16 @@ pub struct ApprovedSpend {
 }
 
 pub struct Signer {
-    name: String,
-    key_package: KeyPackage,
-    wallet: SpWallet,
+    pub(crate) name: String,
+    pub(crate) key_package: KeyPackage,
+    pub(crate) public_key_package: Option<PublicKeyPackage>,
+    pub(crate) wallet: SpWallet,
     nonces: Option<SigningNonces>,
+    /// One nonce pair per input of the pending multi-input send (see `send.rs`).
+    pub(crate) send_nonces: Vec<SigningNonces>,
+    pub(crate) exposure: ExposureCounter,
+    /// Shares were released in this send session and it has not completed.
+    pub(crate) ecdh_pending: bool,
 }
 
 impl Signer {
@@ -100,8 +107,27 @@ impl Signer {
             name: name.into(),
             key_package,
             wallet,
+            public_key_package: None,
             nonces: None,
+            send_nonces: vec![],
+            exposure: ExposureCounter::new(RotationThreshold::Thousand),
+            ecdh_pending: false,
         })
+    }
+
+    /// The public key package (verification shares) is needed to verify other signers' DLEQ
+    /// proofs when sending.
+    pub fn with_public_key_package(mut self, pkp: PublicKeyPackage) -> Self {
+        self.public_key_package = Some(pkp);
+        self
+    }
+
+    pub fn exposure(&self) -> &ExposureCounter {
+        &self.exposure
+    }
+
+    pub fn exposure_mut(&mut self) -> &mut ExposureCounter {
+        &mut self.exposure
     }
 
     pub fn identifier(&self) -> Identifier {
@@ -116,11 +142,15 @@ impl Signer {
         commitments
     }
 
-    fn refuse<T>(&self, reason: impl Into<String>) -> Result<T> {
-        Err(Error::Refused {
+    pub(crate) fn refusal(&self, reason: impl Into<String>) -> Error {
+        Error::Refused {
             who: self.name.clone(),
             reason: reason.into(),
-        })
+        }
+    }
+
+    pub(crate) fn refuse<T>(&self, reason: impl Into<String>) -> Result<T> {
+        Err(self.refusal(reason))
     }
 
     /// Round 2. Nonces are consumed first, so a refused session cannot be retried with them.
@@ -130,6 +160,14 @@ impl Signer {
             Some(n) => n,
             None => return self.refuse("no pending nonces (commit first)"),
         };
+
+        // 0. The funding transaction must be the approved coin's, checked before any expensive
+        //    scanning of an unauthenticated transaction (Opus review F2).
+        if req.funding_tx.compute_txid() != approved.outpoint.txid
+            || req.funding_vout != approved.outpoint.vout
+        {
+            return self.refuse("funding output is not the approved coin");
+        }
 
         // 1. Re-derive tau from the funding transaction with our own b_scan (T7).
         let owned = self
@@ -156,6 +194,9 @@ impl Signer {
         // 3. The transaction is the one we approved.
         if req.spend_tx.input.len() != 1 {
             return self.refuse("exactly one input supported");
+        }
+        if let Err(e) = crate::send::check_tx_shape(req.spend_tx) {
+            return self.refuse(e.to_string()); // F1: version, locktime, sequence
         }
         let want = OutPoint {
             txid: req.funding_tx.compute_txid(),
@@ -230,10 +271,17 @@ impl Coordinator {
             ));
         }
         let pkp = tweak_public_key_package(&self.public_key_package, &owned.tau)?;
+        // F4: a wrong tau is the coordinator's bug; check it here so that aggregate's cheater
+        // detection cannot blame an honest signer.
+        let xonly = XOnlyPublicKey::from_slice(&owned.script_pubkey.as_bytes()[2..])?;
+        if pkp.verifying_key().serialize()?[1..] != xonly.serialize()[..] {
+            return Err(Error::Other(
+                "coordinator error: X + tau*G does not match the output key (wrong tau)".into(),
+            ));
+        }
         let sig = frost_secp256k1_tr::aggregate(signing_package, shares, &pkp)?;
         let bytes = sig.serialize()?;
         let sig = schnorr::Signature::from_slice(&bytes)?;
-        let xonly = XOnlyPublicKey::from_slice(&owned.script_pubkey.as_bytes()[2..])?;
         let msg = Message::from_digest_slice(signing_package.message())?;
         Secp256k1::verification_only().verify_schnorr(&sig, &msg, &xonly)?;
 
