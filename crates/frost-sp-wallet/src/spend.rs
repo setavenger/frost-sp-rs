@@ -90,8 +90,6 @@ pub struct Signer {
     /// One nonce pair per input of the pending multi-input send (see `send.rs`).
     pub(crate) send_nonces: Vec<SigningNonces>,
     pub(crate) exposure: ExposureCounter,
-    /// Shares were released in this send session and it has not completed.
-    pub(crate) ecdh_pending: bool,
 }
 
 impl Signer {
@@ -103,6 +101,10 @@ impl Signer {
                 "wallet B_spend is not the group key of this key package".into(),
             ));
         }
+        let wallet_group_key: [u8; 33] = x
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Other("group key is not 33 bytes".into()))?;
         Ok(Self {
             name: name.into(),
             key_package,
@@ -110,8 +112,8 @@ impl Signer {
             public_key_package: None,
             nonces: None,
             send_nonces: vec![],
-            exposure: ExposureCounter::new(RotationThreshold::Thousand),
-            ecdh_pending: false,
+            exposure: ExposureCounter::new(RotationThreshold::Thousand)
+                .with_group_key(wallet_group_key),
         })
     }
 
@@ -120,6 +122,35 @@ impl Signer {
     pub fn with_public_key_package(mut self, pkp: PublicKeyPackage) -> Self {
         self.public_key_package = Some(pkp);
         self
+    }
+
+    /// Rotation to a new group key: the key material is replaced together with the exposure
+    /// reset, so the budget can only be restored by actually changing the signing share.
+    /// Refuses the group key this signer already holds.
+    pub fn rotate(
+        &mut self,
+        key_package: KeyPackage,
+        wallet: SpWallet,
+        pkp: PublicKeyPackage,
+    ) -> Result<()> {
+        let new_key: [u8; 33] = key_package
+            .verifying_key()
+            .serialize()?
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Other("group key is not 33 bytes".into()))?;
+        if new_key.as_slice() != wallet.b_spend().serialize().as_slice() {
+            return Err(Error::Other(
+                "wallet B_spend is not the group key of this key package".into(),
+            ));
+        }
+        self.exposure.reset_for_rotation(new_key)?;
+        self.key_package = key_package;
+        self.wallet = wallet;
+        self.public_key_package = Some(pkp);
+        self.nonces = None;
+        self.send_nonces.clear();
+        Ok(())
     }
 
     pub fn exposure(&self) -> &ExposureCounter {

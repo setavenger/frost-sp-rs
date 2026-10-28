@@ -2,8 +2,12 @@
 //!
 //! Every non-self recipient scan key `B` makes each cosigner release `D_i = x_i*B` with a
 //! proof. Releases are bounded per group key; above the rotation threshold the signer refuses
-//! to release more until the key has been rotated. Counted: distinct non-self scan keys, plus
-//! sessions that released shares and then aborted. Kept in memory only (PoC).
+//! to release more until the key has been rotated. Counted: distinct non-self scan keys only.
+//! `D_i = x_i*B` is deterministic in `B`, so re-requesting a counted key, or aborting a
+//! session, reveals nothing new and costs nothing.
+//!
+//! The counter is in memory only (PoC): a restart resets it. A reset otherwise happens only
+//! through `Signer::rotate`, which swaps in the new key material together with the reset.
 
 use std::collections::BTreeSet;
 
@@ -31,7 +35,8 @@ impl RotationThreshold {
 pub struct ExposureCounter {
     threshold: RotationThreshold,
     scan_keys: BTreeSet<[u8; 33]>,
-    aborted_sessions: u64,
+    /// The group key this counter belongs to; a reset needs a different one.
+    group_key: Option<[u8; 33]>,
 }
 
 impl ExposureCounter {
@@ -39,8 +44,14 @@ impl ExposureCounter {
         Self {
             threshold,
             scan_keys: BTreeSet::new(),
-            aborted_sessions: 0,
+            group_key: None,
         }
+    }
+
+    /// Bind the counter to the group key it counts for.
+    pub fn with_group_key(mut self, group_key: [u8; 33]) -> Self {
+        self.group_key = Some(group_key);
+        self
     }
 
     pub fn set_threshold(&mut self, threshold: RotationThreshold) {
@@ -48,11 +59,7 @@ impl ExposureCounter {
     }
 
     pub fn count(&self) -> u64 {
-        self.scan_keys.len() as u64 + self.aborted_sessions
-    }
-
-    pub fn aborted_sessions(&self) -> u64 {
-        self.aborted_sessions
+        self.scan_keys.len() as u64
     }
 
     /// Refuse if releasing shares for `new_keys` would push the count above the threshold.
@@ -74,13 +81,21 @@ impl ExposureCounter {
         self.scan_keys.extend(keys.iter().copied());
     }
 
-    pub fn record_abort(&mut self) {
-        self.aborted_sessions += 1;
-    }
-
-    /// Call after the group key has been rotated: the new key starts at zero.
-    pub fn reset_after_rotation(&mut self) {
+    /// Rotation to `new_group_key`: the new key starts at zero. Refuses the key the counter
+    /// is already bound to (or any reset on an unbound counter), so the count cannot be
+    /// cleared without an actual key change.
+    pub(crate) fn reset_for_rotation(&mut self, new_group_key: [u8; 33]) -> Result<()> {
+        match self.group_key {
+            None => return Err(Error::Other("exposure counter has no group key bound".into())),
+            Some(k) if k == new_group_key => {
+                return Err(Error::Other(
+                    "exposure counter reset refused: the group key is unchanged".into(),
+                ))
+            }
+            Some(_) => {}
+        }
         self.scan_keys.clear();
-        self.aborted_sessions = 0;
+        self.group_key = Some(new_group_key);
+        Ok(())
     }
 }

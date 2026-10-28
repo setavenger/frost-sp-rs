@@ -598,7 +598,7 @@ fn t6_no_nonce_reuse_after_a_refused_or_finished_session() {
 }
 
 #[test]
-fn exposure_counter_counts_scan_keys_and_aborted_sessions() {
+fn exposure_counter_counts_distinct_scan_keys_only() {
     let mut a = env(500, &[]);
     let c = SpdkReceiver::new(501);
     let d = SpdkReceiver::new(502);
@@ -607,15 +607,14 @@ fn exposure_counter_counts_scan_keys_and_aborted_sessions() {
     let st = stage(&mut a, &coins, &[pay_sp(&c.code(), 60_000), pay_sp(&d.code(), 60_000)], 1);
     for s in a.signers.iter().filter(|s| st.set.contains(&s.identifier())) {
         assert_eq!(s.exposure().count(), 2);
-        assert_eq!(s.exposure().aborted_sessions(), 0);
     }
-    // Abort in round B: counted once per signer that had released shares.
+    // Abort in round B: costs nothing.
     let mut bad = st.packages.clone();
     bad[2] = frost::SigningPackage::new(bad[2].signing_commitments().clone(), &[1u8; 32]);
     let req = st.request(&st.tx, &st.shares, &bad);
     all_refuse(&mut a, &st, &req);
     for s in a.signers.iter().filter(|s| st.set.contains(&s.identifier())) {
-        assert_eq!(s.exposure().count(), 3);
+        assert_eq!(s.exposure().count(), 2);
     }
     // A session that finishes does not add anything; a repeat recipient is not recounted.
     let coins2 = fund_coins(&a, &[1], None, 7000, 150_000);
@@ -623,14 +622,16 @@ fn exposure_counter_counts_scan_keys_and_aborted_sessions() {
     let req2 = st2.request(&st2.tx, &st2.shares, &st2.packages);
     for s in a.signers.iter_mut().filter(|s| st2.set.contains(&s.identifier())) {
         s.sign_send(&req2, &st2.plan.approved).unwrap();
-        assert_eq!(s.exposure().count(), 3);
+        assert_eq!(s.exposure().count(), 2);
     }
 }
 
 #[test]
 fn exposure_limit_blocks_release_until_rotation() {
     use frost_sp_wallet::exposure::*;
-    let mut e = ExposureCounter::new(RotationThreshold::Thousand);
+    let g1 = sk_from_seed(9001, "g").public_key(&Secp256k1::new()).serialize();
+    let g2 = sk_from_seed(9002, "g").public_key(&Secp256k1::new()).serialize();
+    let mut e = ExposureCounter::new(RotationThreshold::Thousand).with_group_key(g1);
     let keys: Vec<[u8; 33]> = (0..1000u32)
         .map(|i| sk_from_seed(i as u64, "e").public_key(&Secp256k1::new()).serialize())
         .collect();
@@ -640,13 +641,53 @@ fn exposure_limit_blocks_release_until_rotation() {
     let extra = sk_from_seed(5000, "e").public_key(&Secp256k1::new()).serialize();
     assert!(e.check_release(&[extra]).is_err(), "above the threshold");
     assert!(e.check_release(&keys[..1]).is_ok(), "already counted key is free");
-    e.record_abort();
-    assert!(e.check_release(&keys[..1]).is_err(), "aborts count too");
     e.set_threshold(RotationThreshold::Million);
     assert!(e.check_release(&[extra]).is_ok());
-    e.reset_after_rotation();
-    assert_eq!(e.count(), 0);
+    assert_eq!(e.count(), 1000);
+    let _ = g2;
     assert_eq!(RotationThreshold::Billion.limit(), 1_000_000_000);
+}
+
+#[test]
+fn f2_aborts_on_one_scan_key_cost_nothing_distinct_keys_do() {
+    use frost_sp_wallet::exposure::*;
+    let secp = Secp256k1::new();
+    let mut e = ExposureCounter::new(RotationThreshold::Thousand);
+    let one = sk_from_seed(1, "k").public_key(&secp).serialize();
+    for _ in 0..1000 {
+        e.check_release(&[one]).unwrap();
+        e.record_release(&[one]);
+    }
+    assert_eq!(e.count(), 1);
+    // And through a real signer: 1000 aborted round-B sessions for one recipient.
+    let mut a = env(800, &[]);
+    let c = SpdkReceiver::new(801);
+    let coins = fund_coins(&a, &[1, 1, -1], None, 9000, 50_000);
+    let st = stage(&mut a, &coins, &[pay_sp(&c.code(), 100_000)], 1);
+    let mut bad = st.packages.clone();
+    bad[0] = frost::SigningPackage::new(bad[0].signing_commitments().clone(), &[1u8; 32]);
+    for round in 0..1000u64 {
+        let req = st.request(&st.tx, &st.shares, &bad);
+        all_refuse(&mut a, &st, &req);
+        // Re-request shares for the same key (and fresh nonces) as a new session would.
+        let inputs = st.inputs.clone();
+        let req_a = a.coord.ecdh_request(&inputs, &st.plan.approved.outputs, st.set.clone());
+        let mut r = rng(10_000 + round);
+        for s in a.signers.iter_mut().filter(|s| st.set.contains(&s.identifier())) {
+            s.ecdh_shares(&req_a, &st.plan.approved, &mut r).unwrap();
+            s.commit_inputs(inputs.len(), &mut r);
+        }
+    }
+    for s in a.signers.iter().filter(|s| st.set.contains(&s.identifier())) {
+        assert_eq!(s.exposure().count(), 1);
+    }
+    // Distinct keys do count.
+    let e2 = ExposureCounter::new(RotationThreshold::Thousand);
+    let keys: Vec<[u8; 33]> = (0..1001u32)
+        .map(|i| sk_from_seed(i as u64, "d").public_key(&secp).serialize())
+        .collect();
+    assert!(e2.check_release(&keys[..1000]).is_ok());
+    assert!(e2.check_release(&keys).is_err());
 }
 
 #[test]
@@ -666,8 +707,83 @@ fn signer_refuses_ecdh_at_the_exposure_limit() {
         Err(Error::Refused { reason, .. }) => assert!(reason.contains("rotate"), "{reason}"),
         other => panic!("{other:?}"),
     }
-    s.exposure_mut().reset_after_rotation();
-    assert!(s.ecdh_shares(&req, &plan.approved, &mut rng(1)).is_ok());
+    // Same key material: rotation is refused and the signer keeps refusing.
+    let kp = a.group.key_packages.values().next().unwrap().clone();
+    let wallet = frost_sp_wallet::wallet::SpWallet::new(
+        a.group.b_scan,
+        a.group.b_spend().unwrap(),
+        silentpayments::Network::Regtest,
+    )
+    .unwrap();
+    let pkp = a.group.public_key_package.clone();
+    let s = &mut a.signers[0];
+    assert!(s.rotate(kp, wallet, pkp).is_err());
+    assert!(s.ecdh_shares(&req, &plan.approved, &mut rng(1)).is_err());
+    // A genuinely new group: budget restored.
+    let g2 = env(601, &[]);
+    let kp2 = g2.group.key_packages.get(&ident(1)).unwrap().clone();
+    let w2 = frost_sp_wallet::wallet::SpWallet::new(
+        g2.group.b_scan,
+        g2.group.b_spend().unwrap(),
+        silentpayments::Network::Regtest,
+    )
+    .unwrap();
+    s.rotate(kp2, w2, g2.group.public_key_package.clone()).unwrap();
+    assert_eq!(s.exposure().count(), 0);
+}
+
+#[test]
+fn f1_substituted_verifying_share_with_matching_d_is_refused_by_every_signer() {
+    use frost_sp_wallet::spend::Signer;
+    use frost_sp_wallet::wallet::SpWallet;
+    let mut a = env(210, &[]);
+    let c = SpdkReceiver::new(211);
+    // Attacker key x2' for signer 2: X2' in every signer's package, D2' = x2'*B with a valid proof.
+    let x2p = sk_from_seed(77, "x2'");
+    let secp = Secp256k1::new();
+    let x2p_pub = x2p.public_key(&secp);
+    // Substituted package.
+    let mut vs = a.group.public_key_package.verifying_shares().clone();
+    vs.insert(ident(2), frost::keys::VerifyingShare::deserialize(&x2p_pub.serialize()).unwrap());
+    let bad_pkp = frost::keys::PublicKeyPackage::new(vs, *a.group.public_key_package.verifying_key(), Some(2));
+    let wallet = |g: &frost_sp_wallet::group::FrostGroup| SpWallet::new(g.b_scan, g.b_spend().unwrap(), silentpayments::Network::Regtest).unwrap();
+    let rebuilt: Vec<Signer> = a
+        .group
+        .key_packages
+        .values()
+        .map(|kp| Signer::new("s", kp.clone(), wallet(&a.group)).unwrap().with_public_key_package(bad_pkp.clone()))
+        .collect();
+    a.signers = rebuilt;
+    let coins = fund_coins(&a, &[1, 1, -1], None, 21_000, 50_000);
+    let st = stage(&mut a, &coins, &[pay_sp(&c.code(), 100_000)], 210);
+    let mut shares = st.shares.clone();
+    let i = shares.iter().position(|s| s.id == ident(2)).unwrap();
+    let b = shares[i].scan_key;
+    shares[i].d = b.mul_tweak(&secp, &Scalar::from(x2p)).unwrap();
+    shares[i].proof = dleq_prove(&x2p, &b, &[7u8; 32], None).unwrap();
+    // The DLEQ itself passes against X2'; only the package check stops it.
+    let req = st.request(&st.tx, &shares, &st.packages);
+    for r in all_refuse(&mut a, &st, &req) {
+        assert!(r.contains("public key package invalid"), "{r}");
+    }
+}
+
+#[test]
+fn f1_package_with_wrong_own_share_or_group_key_is_refused() {
+    use frost_sp_wallet::send::validate_public_key_package;
+    let a = env(220, &[]);
+    let kp = a.group.key_packages.get(&ident(1)).unwrap();
+    let good = &a.group.public_key_package;
+    let set = [ident(1), ident(2)];
+    validate_public_key_package(good, kp, &set).unwrap();
+    let secp = Secp256k1::new();
+    let fake = frost::keys::VerifyingShare::deserialize(&sk_from_seed(5, "f").public_key(&secp).serialize()).unwrap();
+    let mut vs = good.verifying_shares().clone();
+    vs.insert(ident(1), fake);
+    let own_bad = frost::keys::PublicKeyPackage::new(vs, *good.verifying_key(), Some(2));
+    assert!(validate_public_key_package(&own_bad, kp, &set).is_err());
+    let other = env(221, &[]);
+    assert!(validate_public_key_package(&other.group.public_key_package, kp, &set).is_err());
 }
 
 // ---- Codex review of W2 ----
