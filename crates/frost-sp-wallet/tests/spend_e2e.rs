@@ -447,3 +447,86 @@ fn invalid_p2tr_shaped_output_does_not_block_scanning() {
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0].outpoint.vout, 1);
 }
+
+// ---- Opus review of W1, Low findings F1-F4 ----
+
+#[test]
+fn f1_approval_binds_locktime_sequence_and_version() {
+    let w = world(60, None, &[InputKind::P2wpkh]);
+    let base = build_spend_tx(&w.owned, payout(), Amount::from_sat(1_000)).unwrap();
+    let mut variants = vec![];
+    let mut t = base.clone();
+    t.lock_time = bitcoin::absolute::LockTime::from_height(1_000_000).unwrap();
+    variants.push(t);
+    let mut t = base.clone();
+    t.input[0].sequence = bitcoin::Sequence::from_height(100);
+    variants.push(t);
+    let mut t = base.clone();
+    t.version = bitcoin::transaction::Version::ONE;
+    variants.push(t);
+    for tx in variants {
+        // the package is for the tampered tx, so only the shape check can refuse
+        let mut s = session(&w, tx, None);
+        assert_refused(try_sign(&w, &mut s, |_| {}), "locktime");
+    }
+}
+
+#[test]
+fn f2_approved_outpoint_is_checked_before_scanning() {
+    let w = world(61, None, &[InputKind::P2wpkh]);
+    let tx = build_spend_tx(&w.owned, payout(), Amount::from_sat(1_000)).unwrap();
+    let mut other = w.funding.tx.clone();
+    other.output[0].value = Amount::from_sat(1);
+    let no_spks: Vec<ScriptBuf> = vec![];
+    let mut s = session(&w, tx, None);
+    // A funding tx that is not the approved coin's, and whose scan would even error out
+    // (no prevout scripts): the signer must refuse on the outpoint, never reaching the scan.
+    let approved = approval(
+        &w.owned,
+        &build_spend_tx(&w.owned, payout(), Amount::from_sat(1_000)).unwrap(),
+    );
+    let mut req = req_for(&w, &s.tx, &s.pkg);
+    req.funding_tx = &other;
+    req.funding_prevout_spks = &no_spks;
+    let r = s.signers[0].sign(&req, &approved).map(|_| ());
+    assert_refused(r, "approved coin");
+}
+
+#[test]
+fn f3_tx_spending_segwit_v2_output_is_not_scanned() {
+    let mut w = world(62, None, &[InputKind::P2wpkh]);
+    let wallet = SpWallet::new(sk_from_seed(62, "scan"), w.group.b_spend().unwrap(), NET).unwrap();
+    assert_eq!(wallet.scan_tx(&w.funding.tx, &w.funding.prevout_spks).unwrap().len(), 1);
+    let mut v2 = vec![0x52, 0x20];
+    v2.extend([0x42u8; 32]);
+    let mut txin = w.funding.tx.input[0].clone();
+    txin.previous_output.vout += 1;
+    w.funding.tx.input.push(txin);
+    w.funding.prevout_spks.push(ScriptBuf::from_bytes(v2));
+    assert!(wallet.scan_tx(&w.funding.tx, &w.funding.prevout_spks).unwrap().is_empty());
+}
+
+#[test]
+fn f4_wrong_tau_is_a_coordinator_error_not_a_cheater_accusation() {
+    let w = world(63, Some(2), &[InputKind::P2wpkh]);
+    let tx = build_spend_tx(&w.owned, payout(), Amount::from_sat(1_000)).unwrap();
+    let coord = coordinator(&w.group);
+    let mut signers = make_signers(&w.group, NET, &w.labels());
+    let funding_txo = w.funding.tx.output[w.owned.outpoint.vout as usize].clone();
+    let mut r = rng(3);
+    let mut c = BTreeMap::new();
+    for i in [0usize, 1] {
+        c.insert(signers[i].identifier(), signers[i].commit(&mut r));
+    }
+    let pkg = coord.signing_package(&tx, &funding_txo, c).unwrap();
+    let approved = approval(&w.owned, &tx);
+    let mut shares = BTreeMap::new();
+    for i in [0usize, 1] {
+        let req = req_for(&w, &tx, &pkg);
+        shares.insert(signers[i].identifier(), signers[i].sign(&req, &approved).unwrap());
+    }
+    let mut bad = w.owned.clone();
+    bad.tau[31] ^= 1;
+    let e = coord.finalize(&tx, &bad, &pkg, &shares).unwrap_err();
+    assert!(matches!(&e, Error::Other(m) if m.contains("coordinator error")), "{e}");
+}

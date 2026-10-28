@@ -125,6 +125,13 @@ impl SpWallet {
                 "need one prevout scriptPubKey per input".into(),
             ));
         }
+        // BIP 352: a transaction spending an output with SegWit version > 1 is not scanned.
+        if prevout_spks
+            .iter()
+            .any(|s| s.witness_version().is_some_and(|v| v.to_num() >= 2))
+        {
+            return Ok(vec![]);
+        }
         let secp = Secp256k1::new();
         let mut inputs = TransactionInputs::new();
         for (txin, spk) in tx.input.iter().zip(prevout_spks) {

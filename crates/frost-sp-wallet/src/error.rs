@@ -14,6 +14,12 @@ pub enum Error {
     NoOwnedOutput,
     #[error("signer {who} refuses: {reason}")]
     Refused { who: String, reason: String },
+    #[error("culprit {who}: {reason}")]
+    Culprit { who: String, reason: String },
+    #[error("input set has sum of parities 0: the input key sum would not contain the group key")]
+    ParityCancellation,
+    #[error("invalid scan key: {0}")]
+    InvalidScanKey(&'static str),
     #[error("{0}")]
     Other(String),
 }
