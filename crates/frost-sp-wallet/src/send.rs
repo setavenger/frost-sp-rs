@@ -537,6 +537,14 @@ pub fn derive_scripts(
                     .get(&key)
                     .ok_or_else(|| Error::Other("no ECDH value for scan key".into()))?;
                 let k = k_of.entry(key).or_insert(0);
+                // BIP 352: senders fail beyond K_max outputs per scan key (a receiver stops
+                // scanning there, so the excess outputs would never be found).
+                if *k >= crate::wallet::K_MAX {
+                    return Err(Error::Other(format!(
+                        "more than K_max = {} outputs for one scan key",
+                        crate::wallet::K_MAX
+                    )));
+                }
                 let s = sp_output_script(spend_key, e, *k)?;
                 *k += 1;
                 Ok(s)
@@ -1051,11 +1059,21 @@ fn script_len_of(dest: &PaymentDest) -> usize {
     }
 }
 
-/// vsize of a transaction with key-path P2TR inputs.
+fn varint_len(n: usize) -> usize {
+    match n {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        _ => 5,
+    }
+}
+
+/// vsize of a transaction with `n_in` key-path P2TR inputs (64-byte signature witness) and
+/// outputs with the given script lengths, using the real CompactSize lengths.
 fn est_vsize(n_in: usize, script_lens: &[usize]) -> u64 {
-    // 10.5 overhead + 57.5 per taproot key-path input, 8 + 1 + script per output (rounded up)
-    let outs: usize = script_lens.iter().map(|l| 9 + l).sum();
-    (11 + (115 * n_in).div_ceil(2) + outs) as u64
+    let outs: usize = script_lens.iter().map(|l| 8 + varint_len(*l) + l).sum();
+    let non_witness = 4 + varint_len(n_in) + n_in * 41 + varint_len(script_lens.len()) + outs + 4;
+    let witness = 2 + n_in * 66; // marker+flag, then (item count + length + 64) per input
+    (non_witness * 4 + witness).div_ceil(4) as u64
 }
 
 /// Result of coin selection: what the signers are asked to approve.
@@ -1081,7 +1099,7 @@ pub fn plan_send(
         .collect::<Result<_>>()?;
     sorted.sort_by_key(|(c, _)| std::cmp::Reverse(c.value));
 
-    let mut lens: Vec<usize> = payments.iter().map(|p| script_len_of(&p.dest)).collect();
+    let lens: Vec<usize> = payments.iter().map(|p| script_len_of(&p.dest)).collect();
     let mut picked: Vec<(SpendableCoin, i8)> = vec![];
     for cand in sorted {
         picked.push(cand);
@@ -1092,8 +1110,10 @@ pub fn plan_send(
             l.push(34);
             fee_rate_sat_vb * est_vsize(picked.len(), &l)
         };
-        if sum_g != 0 && have >= target + fee_with_change {
-            let change = have - target - fee_with_change;
+        let fee_no_change = fee_rate_sat_vb * est_vsize(picked.len(), &lens);
+        if sum_g != 0 && have >= target + fee_no_change {
+            // Change only if it pays for itself and is not dust; otherwise the rest is fee.
+            let change = have.saturating_sub(target + fee_with_change);
             let mut outputs: Vec<ApprovedOutput> = payments
                 .iter()
                 .map(|p| ApprovedOutput {
@@ -1113,7 +1133,6 @@ pub fn plan_send(
             } else {
                 have - target
             };
-            lens.truncate(payments.len());
             return Ok(SendPlan {
                 approved: ApprovedSend {
                     inputs: picked

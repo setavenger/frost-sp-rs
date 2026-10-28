@@ -669,3 +669,49 @@ fn signer_refuses_ecdh_at_the_exposure_limit() {
     s.exposure_mut().reset_after_rotation();
     assert!(s.ecdh_shares(&req, &plan.approved, &mut rng(1)).is_ok());
 }
+
+// ---- Codex review of W2 ----
+
+#[test]
+fn codex1_more_than_k_max_outputs_per_scan_key_is_refused() {
+    let c = SpdkReceiver::new(700);
+    let ecdh_dummy = sk_from_seed(1, "d").public_key(&Secp256k1::new());
+    let one = ApprovedOutput {
+        dest: ApprovedDest::sp(&c.code()),
+        amount: Amount::from_sat(500),
+    };
+    let mut ecdh = BTreeMap::new();
+    ecdh.insert(c.code().scan_key().serialize(), ecdh_dummy);
+    let at_limit = vec![one.clone(); 2323];
+    assert_eq!(derive_scripts(&at_limit, &ecdh).unwrap().len(), 2323);
+    let over = vec![one; 2324];
+    assert!(derive_scripts(&over, &ecdh).is_err());
+}
+
+#[test]
+fn codex2_no_change_send_that_exactly_affords_the_fee_is_planned() {
+    let a = env(710, &[]);
+    let c = SpdkReceiver::new(711);
+    let coins = fund_coins(&a, &[1], None, 7100, 100_000);
+    let plan = plan_send(a.coord.wallet(), &coins, &[pay_sp(&c.code(), 99_880)], 1).unwrap();
+    assert_eq!(plan.approved.outputs.len(), 1, "no change output");
+    assert_eq!(plan.fee.to_sat(), 120);
+}
+
+#[test]
+fn codex3_fee_estimate_matches_the_real_vsize_at_compactsize_boundaries() {
+    let mut a = env(720, &[]);
+    let c = SpdkReceiver::new(721);
+    for n_pay in [3usize, 252, 253] {
+        let coins = fund_coins(&a, &[1], None, 7200 + n_pay as u64, 400_000);
+        let pays: Vec<Payment> = (0..n_pay).map(|_| pay_sp(&c.code(), 500)).collect();
+        let (tx, plan) =
+            send_payment(&a.coord, &mut a.signers, &[ident(1), ident(2)], &coins, &pays, 1, &mut rng(3)).unwrap();
+        assert!(
+            plan.fee.to_sat() >= tx.vsize() as u64,
+            "{n_pay} payments: fee {} < vsize {}",
+            plan.fee.to_sat(),
+            tx.vsize()
+        );
+    }
+}
