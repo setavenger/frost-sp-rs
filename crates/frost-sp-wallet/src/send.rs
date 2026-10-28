@@ -840,8 +840,15 @@ impl Signer {
                 return self.refuse(format!("output {i} amount differs from the approved one"));
             }
         }
-        let in_sum: u64 = resolved.iter().map(|r| r.txout.value.to_sat()).sum();
-        let out_sum: u64 = req.tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let sum = |vals: Vec<u64>| {
+            vals.into_iter().try_fold(0u64, |a, v| a.checked_add(v)).filter(|s| *s <= MAX_MONEY_SATS)
+        };
+        let (Some(in_sum), Some(out_sum)) = (
+            sum(resolved.iter().map(|r| r.txout.value.to_sat()).collect()),
+            sum(req.tx.output.iter().map(|o| o.value.to_sat()).collect()),
+        ) else {
+            return self.refuse("amounts are outside the monetary range");
+        };
         match in_sum.checked_sub(out_sum) {
             Some(fee) if fee <= approved.max_fee.to_sat() => {}
             _ => return self.refuse("fee exceeds the approved maximum"),
@@ -1190,6 +1197,128 @@ pub fn plan_send(
         "insufficient funds, or no input set with a non-zero sum of parities".into(),
     ))
 }
+
+/// "Spend exactly these coins": every given coin is an input, in the given order, `payments`
+/// are paid in order and `change` (when given and not dust) is the last output.
+///
+/// Refuses when the coins' parities sum to 0 (see [`check_parity_guard`]), when they do not
+/// cover payments plus fee, and, with no `change` destination, when the leftover would burn
+/// more than `MAX_BURN_FACTOR` times the estimated fee. This is the planner behind the
+/// external-signer interface, whose caller chooses the inputs.
+pub fn plan_spend_exact(
+    wallet: &SpWallet,
+    coins: &[SpendableCoin],
+    payments: &[Payment],
+    change: Option<&PaymentDest>,
+    fee_rate_sat_vb: u64,
+) -> Result<SendPlan> {
+    if coins.is_empty() {
+        return Err(Error::Other("no coins to spend".into()));
+    }
+    let resolved = coins
+        .iter()
+        .map(|c| resolve_input(wallet, &c.source))
+        .collect::<Result<Vec<_>>>()?;
+    let uniq: BTreeSet<_> = resolved.iter().map(|r| r.outpoint).collect();
+    if uniq.len() != resolved.len() {
+        return Err(Error::Other("duplicate input".into()));
+    }
+    for (c, r) in coins.iter().zip(&resolved) {
+        if r.txout.value != c.value {
+            return Err(Error::Other(format!(
+                "coin {} is worth {} per its funding transaction, not {}",
+                r.outpoint, r.txout.value, c.value
+            )));
+        }
+    }
+    check_parity_guard(&resolved.iter().map(|r| r.g).collect::<Vec<_>>())?;
+
+    // Monetary validation before anything is signed: positive amounts inside the monetary
+    // range, and every sum and product checked (a wrapped sum would sign a negative output).
+    let money = |sum: Option<u64>, what: &str| -> Result<u64> {
+        sum.filter(|v| *v <= MAX_MONEY_SATS)
+            .ok_or_else(|| Error::Other(format!("{what} is outside the monetary range")))
+    };
+    if payments.iter().any(|p| p.amount.to_sat() == 0) {
+        return Err(Error::Other("a payment of 0 sats".into()));
+    }
+    let have = money(
+        coins.iter().try_fold(0u64, |a, c| a.checked_add(c.value.to_sat())),
+        "the coins' value",
+    )?;
+    let target = money(
+        payments.iter().try_fold(0u64, |a, p| a.checked_add(p.amount.to_sat())),
+        "the payments' sum",
+    )?;
+    let fee_for = |n_out_lens: &[usize]| -> Result<u64> {
+        fee_rate_sat_vb
+            .checked_mul(est_vsize(coins.len(), n_out_lens))
+            .filter(|f| *f <= MAX_MONEY_SATS)
+            .ok_or_else(|| Error::Other("fee rate is outside any sane range".into()))
+    };
+    let mut lens: Vec<usize> = payments.iter().map(|p| script_len_of(&p.dest)).collect();
+    let fee_no_change = fee_for(&lens)?;
+    if have < target.saturating_add(fee_no_change) {
+        return Err(Error::Other(format!(
+            "insufficient funds: coins hold {have} sats, payments {target} plus fee {fee_no_change}"
+        )));
+    }
+    let mut outputs: Vec<ApprovedOutput> = payments
+        .iter()
+        .map(|p| ApprovedOutput {
+            dest: match &p.dest {
+                PaymentDest::Sp(c) => ApprovedDest::sp(c),
+                PaymentDest::Script(s) => ApprovedDest::Script(s.clone()),
+            },
+            amount: p.amount,
+        })
+        .collect();
+    let mut fee = have - target;
+    if let Some(change) = change {
+        lens.push(script_len_of(change));
+        let fee_with_change = fee_for(&lens)?;
+        let amount = have.saturating_sub(target.saturating_add(fee_with_change));
+        if amount >= dust_threshold(change) {
+            outputs.push(ApprovedOutput {
+                dest: match change {
+                    PaymentDest::Sp(c) => ApprovedDest::sp(c),
+                    PaymentDest::Script(s) => ApprovedDest::Script(s.clone()),
+                },
+                amount: Amount::from_sat(amount),
+            });
+            fee = fee_with_change;
+        }
+    }
+    if fee > fee_no_change.max(1).saturating_mul(MAX_BURN_FACTOR) {
+        return Err(Error::Other(format!(
+            "the leftover {fee} sats would all go to fees (about {fee_no_change} needed); declare a change address"
+        )));
+    }
+    Ok(SendPlan {
+        approved: ApprovedSend {
+            inputs: resolved.iter().map(|r| r.outpoint).collect(),
+            outputs,
+            max_fee: Amount::from_sat(fee),
+        },
+        coins: coins.to_vec(),
+        fee: Amount::from_sat(fee),
+    })
+}
+
+/// 21 million BTC in sats.
+pub const MAX_MONEY_SATS: u64 = 2_100_000_000_000_000;
+
+/// Smallest change output worth creating for this destination: the relay dust threshold of
+/// its script (an SP output is P2TR).
+fn dust_threshold(dest: &PaymentDest) -> u64 {
+    match dest {
+        PaymentDest::Sp(_) => DUST_CHANGE_SATS,
+        PaymentDest::Script(s) => s.minimal_non_dust().to_sat(),
+    }
+}
+
+/// A plan without change may leave at most this many times the estimated fee unspent.
+pub const MAX_BURN_FACTOR: u64 = 10;
 
 /// Run both rounds in process: `signers` are the cosigners, `signing_set` the ones used.
 pub fn execute_send<R: RngCore + CryptoRng>(

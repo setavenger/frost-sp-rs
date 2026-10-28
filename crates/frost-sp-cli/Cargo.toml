@@ -1,0 +1,27 @@
+[package]
+name = "frost-sp-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PoC external signer (frost-sp-signer) for the BlindBit test kit: a t-of-n FROST Silent Payment wallet, all key packages in one process. PoC ONLY."
+
+[[bin]]
+name = "frost-sp-signer"
+path = "src/main.rs"
+
+[dependencies]
+bitcoin.workspace = true
+frost-sp-wallet = { path = "../frost-sp-wallet" }
+frost-secp256k1-tr = "=3.0.0"
+hex.workspace = true
+rand = { version = "0.8", features = ["std", "std_rng"] }
+secp256k1.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+silentpayments.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true

@@ -1824,6 +1824,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "frost-sp-cli"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "frost-secp256k1-tr",
+ "frost-sp-wallet",
+ "hex",
+ "rand 0.8.8",
+ "secp256k1 0.29.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "silentpayments",
+]
+
+[[package]]
 name = "frost-sp-wallet"
 version = "0.1.0"
 dependencies = [

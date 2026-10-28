@@ -5,6 +5,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
+use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Transaction};
 use common::*;
 use frost_secp256k1_tr as frost;
@@ -830,4 +831,102 @@ fn codex3_fee_estimate_matches_the_real_vsize_at_compactsize_boundaries() {
             tx.vsize()
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// W4: "spend exactly these coins"
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn spend_exact_keeps_every_coin_in_order_and_puts_change_last() {
+    let a = env(21, &[]);
+    let c = SpdkReceiver::new(22);
+    let coins = fund_coins(&a, &[1, -1, 1], None, 700, 50_000);
+    let pay = vec![pay_sp(&c.code(), 60_000)];
+    let change = PaymentDest::Sp(a.coord.wallet().change_address());
+    let plan = plan_spend_exact(a.coord.wallet(), &coins, &pay, Some(&change), 2).unwrap();
+    let want: Vec<_> = coins.iter().map(|c| c.source.funding_tx.compute_txid()).collect();
+    let got: Vec<_> = plan.approved.inputs.iter().map(|o| o.txid).collect();
+    assert_eq!(got, want, "all coins, in the given order");
+    assert_eq!(plan.approved.outputs.len(), 2);
+    let spent: u64 = plan.approved.outputs.iter().map(|o| o.amount.to_sat()).sum();
+    assert_eq!(spent + plan.fee.to_sat(), 150_000);
+    assert_eq!(plan.approved.outputs[1].dest, ApprovedDest::sp(&a.coord.wallet().change_address()));
+}
+
+#[test]
+fn spend_exact_refuses_cancelling_parities_short_funds_and_a_burn() {
+    let a = env(23, &[]);
+    let c = SpdkReceiver::new(24);
+    let pay = vec![pay_sp(&c.code(), 10_000)];
+    let change = PaymentDest::Sp(a.coord.wallet().change_address());
+
+    let cancel = fund_coins(&a, &[1, -1], None, 800, 50_000);
+    let e = plan_spend_exact(a.coord.wallet(), &cancel, &pay, Some(&change), 2).unwrap_err();
+    assert!(matches!(e, Error::ParityCancellation), "{e}");
+
+    let one = fund_coins(&a, &[1], None, 900, 50_000);
+    let big = vec![pay_sp(&c.code(), 60_000)];
+    let e = plan_spend_exact(a.coord.wallet(), &one, &big, Some(&change), 2).unwrap_err();
+    assert!(e.to_string().contains("insufficient funds"), "{e}");
+
+    // No change destination: 40 000 sats would be burned as fee.
+    let e = plan_spend_exact(a.coord.wallet(), &one, &pay, None, 2).unwrap_err();
+    assert!(e.to_string().contains("declare a change address"), "{e}");
+
+    // A coin whose claimed value is not the funding output's.
+    let mut lie = one.clone();
+    lie[0].value = Amount::from_sat(1);
+    let e = plan_spend_exact(a.coord.wallet(), &lie, &pay, Some(&change), 2).unwrap_err();
+    assert!(e.to_string().contains("per its funding transaction"), "{e}");
+}
+
+#[test]
+fn spend_exact_round_trips_through_the_signers() {
+    let mut a = env(25, &[]);
+    let c = SpdkReceiver::new(26);
+    let set = [ident(2), ident(3)];
+    let coins = fund_coins(&a, &[1, 1, -1], None, 1000, 50_000);
+    let pay = vec![pay_sp(&c.code(), 100_000)];
+    let change = PaymentDest::Sp(a.coord.wallet().change_address());
+    let plan = plan_spend_exact(a.coord.wallet(), &coins, &pay, Some(&change), 2).unwrap();
+    let tx = execute_send(&a.coord, &mut a.signers, &set, &plan, &mut rng(5)).unwrap();
+    assert_eq!(tx.input.len(), 3);
+    assert_eq!(tx.output.len(), 2);
+    let spks = prevout_spks_of(&coins);
+    assert_eq!(c.scan(&tx, &spks).len(), 1);
+    let mine = a.coord.wallet().scan_tx(&tx, &spks).unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].label, Some(0));
+}
+
+#[test]
+fn spend_exact_rejects_wrapping_amounts_zero_payments_and_absurd_fee_rates() {
+    let a = env(27, &[]);
+    let c = SpdkReceiver::new(28);
+    let coins = fund_coins(&a, &[1], None, 1100, 100_000);
+    let change = PaymentDest::Sp(a.coord.wallet().change_address());
+    let w = a.coord.wallet();
+    // 2^64 - 90000 plus 100000 wraps to 10000 in unchecked arithmetic.
+    let wrap = vec![pay_sp(&c.code(), u64::MAX - 89_999), pay_sp(&c.code(), 100_000)];
+    assert!(plan_spend_exact(w, &coins, &wrap, Some(&change), 5).is_err());
+    let zero = vec![pay_sp(&c.code(), 0)];
+    assert!(plan_spend_exact(w, &coins, &zero, Some(&change), 5).unwrap_err().to_string().contains("0 sats"));
+    let one = vec![pay_sp(&c.code(), 1_000)];
+    assert!(plan_spend_exact(w, &coins, &one, Some(&change), u64::MAX / 100).is_err());
+}
+
+#[test]
+fn spend_exact_uses_the_dust_threshold_of_the_change_script() {
+    let a = env(29, &[]);
+    let c = SpdkReceiver::new(30);
+    let coins = fund_coins(&a, &[1], None, 1200, 100_000);
+    let w = a.coord.wallet();
+    let p2pkh = ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_raw_hash(bitcoin::hashes::hash160::Hash::from_byte_array([9u8; 20])));
+    // Leaves roughly 400 sats of change: fine for P2TR (330), dust for P2PKH (546).
+    let pay = vec![pay_sp(&c.code(), 98_875)];
+    let sp = plan_spend_exact(w, &coins, &pay, Some(&PaymentDest::Sp(w.change_address())), 5).unwrap();
+    assert_eq!(sp.approved.outputs.len(), 2);
+    let pk = plan_spend_exact(w, &coins, &pay, Some(&PaymentDest::Script(p2pkh)), 5).unwrap();
+    assert_eq!(pk.approved.outputs.len(), 1, "sub-dust P2PKH change goes to fee");
 }
