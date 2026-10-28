@@ -26,7 +26,7 @@ Background brief (read only if you need it): https://claude.ai/artifact/VnQsgZmF
 - **PoC repo:** `/work/frost-sp-poc`, a clone of `macgyver13/bip375-examples` (MIT).
   - Integration branch: `frost-sp` (upstream `frost-signer` plus this run's files).
   - Remote `upstream` is macgyver13's repo. **Never push to it.**
-  - There is no `origin` yet: creating a GitHub repo failed because the token lacks permission.
+  - `origin` is `github.com/setavenger/frost-sp-rs` (**public**). Push your feature branch there and open your PR against `frost-sp`, never `main`. Don't merge.
 - **Your work:** a feature branch off `frost-sp`, in your own git worktree:
   `git -C /work/frost-sp-poc worktree add /work/frost-sp-poc-wt/<wp> -b <branch> frost-sp`
   Commit on your branch. **Don't merge**; the orchestrator merges into `frost-sp`.
@@ -91,7 +91,7 @@ Background brief (read only if you need it): https://claude.ai/artifact/VnQsgZmF
 4. **Review:** commit, then run `/review` on your branch diff with base `frost-sp`.
 5. **QA:** run `/qa` in CLI mode: the test suite plus the example binaries' command-line paths end to end. Browser and GUI work are out of scope.
 6. **Codex review:** an independent review in a Herdr pane (recipe below). Fix every finding, or rebut it in your summary.
-7. **Ship:** run `/ship` only if a GitHub `origin` remote exists. Otherwise commit on your branch and stop.
+7. **Ship:** run `/ship` with base `frost-sp`: push the branch and open the PR against `frost-sp`. Don't merge.
 
 ### Codex review recipe
 
