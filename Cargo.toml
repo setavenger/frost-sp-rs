@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/bip375-helpers",
+    "crates/frost-sp-wallet",
     "crates/spdk-uniffi",
     "examples/hardware-signer",
     "examples/frost-signer",
@@ -51,3 +52,13 @@ codegen-units = 1
 [workspace.lints.clippy]
 unwrap_used = { level = "deny", priority = 1 }
 expect_used = "allow"
+
+# Debug-build crypto is slow enough to make the BIP 352 vector run take minutes.
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.secp256k1-sys]
+opt-level = 3
+[profile.dev.package.frost-core]
+opt-level = 3
+[profile.dev.package.frost-secp256k1-tr]
+opt-level = 3
