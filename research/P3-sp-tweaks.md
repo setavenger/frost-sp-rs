@@ -4,6 +4,14 @@ Draft proof sketch, 2026-10-28. Not reviewed. Confidence is marked per section.
 
 **Result.** P3 holds, with a tight reduction. The reduction goes to the untweaked BIP 445 / FROST3 theorem (CGRS23, which is what BIP 445 itself relies on), not to GK24. The link is one short lemma, "a tweak is part of the message". It works because both hashes that an honest partial signature depends on commit to the tweaked key `Q`. GK24 does not apply directly: it proves a different FROST variant, and its tweak is a single hash output rather than a sum of two. T7 is what makes the lemma go through.
 
+**Update, same day: the PoC uses ZF's RFC 9591 FROST, not BIP 445.** The argument carries over (see `run/opus-review-w1.md`, last section).
+- In ZF FROST, the binding factor (H1) and the challenge (H2) both commit to the tweaked key `X+τG`.
+- Two edits to the reduction are needed:
+  - add `λ_i·c·g_Q·τ` to each simulated share, because the PoC folds `τ` into every share;
+  - simulate H4, because H1 sees only a hash of the message.
+- The base theorem then becomes the FROST1 result of Bellare–Crites–Komlo–Maller–Tessaro–Zhu 2022 (eprint 2022/833: OMDL, ROM, trusted dealer) instead of CGRS23.
+- Still open: a written proof, the x-only/even-Y adaptation, and any DKG for this FROST shape.
+
 Notation: `p` is the group order (BIP 445 calls it `ord`), and `G` is the generator. `g_Y ∈ {±1}` is +1 iff the point `Y` has even y. `H_ss`, `H_lab`, `H_non` and `H_sig` are the tagged hashes `BIP0352/SharedSecret`, `BIP0352/Label`, `BIP0445/noncecoef` and `BIP0340/challenge`. They are modelled as independent random oracles. `H_reg` is the DKG's proof-of-possession hash.
 
 ## 1. Statement (confidence: high)
