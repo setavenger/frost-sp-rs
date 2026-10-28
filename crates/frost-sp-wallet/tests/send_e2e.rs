@@ -643,12 +643,8 @@ fn exposure_limit_blocks_release_until_rotation() {
     assert!(e.check_release(&keys[..1]).is_ok(), "already counted key is free");
     e.set_threshold(RotationThreshold::Million);
     assert!(e.check_release(&[extra]).is_ok());
-    assert!(e.reset_for_rotation(g1).is_err(), "same group key: no reset");
     assert_eq!(e.count(), 1000);
-    e.reset_for_rotation(g2).unwrap();
-    assert_eq!(e.count(), 0);
-    assert!(e.reset_for_rotation(g2).is_err(), "now bound to the new key");
-    assert!(ExposureCounter::new(RotationThreshold::Thousand).reset_for_rotation(g1).is_err());
+    let _ = g2;
     assert_eq!(RotationThreshold::Billion.limit(), 1_000_000_000);
 }
 
@@ -711,12 +707,29 @@ fn signer_refuses_ecdh_at_the_exposure_limit() {
         Err(Error::Refused { reason, .. }) => assert!(reason.contains("rotate"), "{reason}"),
         other => panic!("{other:?}"),
     }
-    let same = a.group.public_key_package.verifying_key().serialize().unwrap();
+    // Same key material: rotation is refused and the signer keeps refusing.
+    let kp = a.group.key_packages.values().next().unwrap().clone();
+    let wallet = frost_sp_wallet::wallet::SpWallet::new(
+        a.group.b_scan,
+        a.group.b_spend().unwrap(),
+        silentpayments::Network::Regtest,
+    )
+    .unwrap();
+    let pkp = a.group.public_key_package.clone();
     let s = &mut a.signers[0];
-    assert!(s.exposure_mut().reset_for_rotation(same.as_slice().try_into().unwrap()).is_err());
-    let new_key = sk_from_seed(9003, "g").public_key(&Secp256k1::new()).serialize();
-    s.exposure_mut().reset_for_rotation(new_key).unwrap();
-    assert!(s.ecdh_shares(&req, &plan.approved, &mut rng(1)).is_ok());
+    assert!(s.rotate(kp, wallet, pkp).is_err());
+    assert!(s.ecdh_shares(&req, &plan.approved, &mut rng(1)).is_err());
+    // A genuinely new group: budget restored.
+    let g2 = env(601, &[]);
+    let kp2 = g2.group.key_packages.get(&ident(1)).unwrap().clone();
+    let w2 = frost_sp_wallet::wallet::SpWallet::new(
+        g2.group.b_scan,
+        g2.group.b_spend().unwrap(),
+        silentpayments::Network::Regtest,
+    )
+    .unwrap();
+    s.rotate(kp2, w2, g2.group.public_key_package.clone()).unwrap();
+    assert_eq!(s.exposure().count(), 0);
 }
 
 #[test]

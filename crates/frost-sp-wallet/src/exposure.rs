@@ -7,7 +7,7 @@
 //! session, reveals nothing new and costs nothing.
 //!
 //! The counter is in memory only (PoC): a restart resets it. A reset otherwise happens only
-//! through [`ExposureCounter::reset_for_rotation`] with a different group key.
+//! through `Signer::rotate`, which swaps in the new key material together with the reset.
 
 use std::collections::BTreeSet;
 
@@ -84,7 +84,7 @@ impl ExposureCounter {
     /// Rotation to `new_group_key`: the new key starts at zero. Refuses the key the counter
     /// is already bound to (or any reset on an unbound counter), so the count cannot be
     /// cleared without an actual key change.
-    pub fn reset_for_rotation(&mut self, new_group_key: [u8; 33]) -> Result<()> {
+    pub(crate) fn reset_for_rotation(&mut self, new_group_key: [u8; 33]) -> Result<()> {
         match self.group_key {
             None => return Err(Error::Other("exposure counter has no group key bound".into())),
             Some(k) if k == new_group_key => {

@@ -124,6 +124,35 @@ impl Signer {
         self
     }
 
+    /// Rotation to a new group key: the key material is replaced together with the exposure
+    /// reset, so the budget can only be restored by actually changing the signing share.
+    /// Refuses the group key this signer already holds.
+    pub fn rotate(
+        &mut self,
+        key_package: KeyPackage,
+        wallet: SpWallet,
+        pkp: PublicKeyPackage,
+    ) -> Result<()> {
+        let new_key: [u8; 33] = key_package
+            .verifying_key()
+            .serialize()?
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Other("group key is not 33 bytes".into()))?;
+        if new_key.as_slice() != wallet.b_spend().serialize().as_slice() {
+            return Err(Error::Other(
+                "wallet B_spend is not the group key of this key package".into(),
+            ));
+        }
+        self.exposure.reset_for_rotation(new_key)?;
+        self.key_package = key_package;
+        self.wallet = wallet;
+        self.public_key_package = Some(pkp);
+        self.nonces = None;
+        self.send_nonces.clear();
+        Ok(())
+    }
+
     pub fn exposure(&self) -> &ExposureCounter {
         &self.exposure
     }
