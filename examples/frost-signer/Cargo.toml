@@ -17,7 +17,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 bip375-helpers.workspace = true
 bitcoin.workspace = true
-frost-secp256k1-tr = "3.0.0"
+frost-secp256k1-tr = "=3.0.0"
 hex.workspace = true
 k256 = "0.13"
 psbt.workspace = true

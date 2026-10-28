@@ -715,3 +715,70 @@ fn codex3_fee_estimate_matches_the_real_vsize_at_compactsize_boundaries() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// W4: "spend exactly these coins"
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn spend_exact_keeps_every_coin_in_order_and_puts_change_last() {
+    let a = env(21, &[]);
+    let c = SpdkReceiver::new(22);
+    let coins = fund_coins(&a, &[1, -1, 1], None, 700, 50_000);
+    let pay = vec![pay_sp(&c.code(), 60_000)];
+    let change = PaymentDest::Sp(a.coord.wallet().change_address());
+    let plan = plan_spend_exact(a.coord.wallet(), &coins, &pay, Some(&change), 2).unwrap();
+    let want: Vec<_> = coins.iter().map(|c| c.source.funding_tx.compute_txid()).collect();
+    let got: Vec<_> = plan.approved.inputs.iter().map(|o| o.txid).collect();
+    assert_eq!(got, want, "all coins, in the given order");
+    assert_eq!(plan.approved.outputs.len(), 2);
+    let spent: u64 = plan.approved.outputs.iter().map(|o| o.amount.to_sat()).sum();
+    assert_eq!(spent + plan.fee.to_sat(), 150_000);
+    assert_eq!(plan.approved.outputs[1].dest, ApprovedDest::sp(&a.coord.wallet().change_address()));
+}
+
+#[test]
+fn spend_exact_refuses_cancelling_parities_short_funds_and_a_burn() {
+    let a = env(23, &[]);
+    let c = SpdkReceiver::new(24);
+    let pay = vec![pay_sp(&c.code(), 10_000)];
+    let change = PaymentDest::Sp(a.coord.wallet().change_address());
+
+    let cancel = fund_coins(&a, &[1, -1], None, 800, 50_000);
+    let e = plan_spend_exact(a.coord.wallet(), &cancel, &pay, Some(&change), 2).unwrap_err();
+    assert!(matches!(e, Error::ParityCancellation), "{e}");
+
+    let one = fund_coins(&a, &[1], None, 900, 50_000);
+    let big = vec![pay_sp(&c.code(), 60_000)];
+    let e = plan_spend_exact(a.coord.wallet(), &one, &big, Some(&change), 2).unwrap_err();
+    assert!(e.to_string().contains("insufficient funds"), "{e}");
+
+    // No change destination: 40 000 sats would be burned as fee.
+    let e = plan_spend_exact(a.coord.wallet(), &one, &pay, None, 2).unwrap_err();
+    assert!(e.to_string().contains("declare a change address"), "{e}");
+
+    // A coin whose claimed value is not the funding output's.
+    let mut lie = one.clone();
+    lie[0].value = Amount::from_sat(1);
+    let e = plan_spend_exact(a.coord.wallet(), &lie, &pay, Some(&change), 2).unwrap_err();
+    assert!(e.to_string().contains("per its funding transaction"), "{e}");
+}
+
+#[test]
+fn spend_exact_round_trips_through_the_signers() {
+    let mut a = env(25, &[]);
+    let c = SpdkReceiver::new(26);
+    let set = [ident(2), ident(3)];
+    let coins = fund_coins(&a, &[1, 1, -1], None, 1000, 50_000);
+    let pay = vec![pay_sp(&c.code(), 100_000)];
+    let change = PaymentDest::Sp(a.coord.wallet().change_address());
+    let plan = plan_spend_exact(a.coord.wallet(), &coins, &pay, Some(&change), 2).unwrap();
+    let tx = execute_send(&a.coord, &mut a.signers, &set, &plan, &mut rng(5)).unwrap();
+    assert_eq!(tx.input.len(), 3);
+    assert_eq!(tx.output.len(), 2);
+    let spks = prevout_spks_of(&coins);
+    assert_eq!(c.scan(&tx, &spks).len(), 1);
+    let mine = a.coord.wallet().scan_tx(&tx, &spks).unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].label, Some(0));
+}

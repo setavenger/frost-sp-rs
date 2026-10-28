@@ -1152,6 +1152,95 @@ pub fn plan_send(
     ))
 }
 
+/// "Spend exactly these coins": every given coin is an input, in the given order, `payments`
+/// are paid in order and `change` (when given and not dust) is the last output.
+///
+/// Refuses when the coins' parities sum to 0 (see [`check_parity_guard`]), when they do not
+/// cover payments plus fee, and, with no `change` destination, when the leftover would burn
+/// more than `MAX_BURN_FACTOR` times the estimated fee. This is the planner behind the
+/// external-signer interface, whose caller chooses the inputs.
+pub fn plan_spend_exact(
+    wallet: &SpWallet,
+    coins: &[SpendableCoin],
+    payments: &[Payment],
+    change: Option<&PaymentDest>,
+    fee_rate_sat_vb: u64,
+) -> Result<SendPlan> {
+    if coins.is_empty() {
+        return Err(Error::Other("no coins to spend".into()));
+    }
+    let resolved = coins
+        .iter()
+        .map(|c| resolve_input(wallet, &c.source))
+        .collect::<Result<Vec<_>>>()?;
+    let uniq: BTreeSet<_> = resolved.iter().map(|r| r.outpoint).collect();
+    if uniq.len() != resolved.len() {
+        return Err(Error::Other("duplicate input".into()));
+    }
+    for (c, r) in coins.iter().zip(&resolved) {
+        if r.txout.value != c.value {
+            return Err(Error::Other(format!(
+                "coin {} is worth {} per its funding transaction, not {}",
+                r.outpoint, r.txout.value, c.value
+            )));
+        }
+    }
+    check_parity_guard(&resolved.iter().map(|r| r.g).collect::<Vec<_>>())?;
+
+    let have: u64 = coins.iter().map(|c| c.value.to_sat()).sum();
+    let target: u64 = payments.iter().map(|p| p.amount.to_sat()).sum();
+    let mut lens: Vec<usize> = payments.iter().map(|p| script_len_of(&p.dest)).collect();
+    let fee_no_change = fee_rate_sat_vb * est_vsize(coins.len(), &lens);
+    if have < target + fee_no_change {
+        return Err(Error::Other(format!(
+            "insufficient funds: coins hold {have} sats, payments {target} plus fee {fee_no_change}"
+        )));
+    }
+    let mut outputs: Vec<ApprovedOutput> = payments
+        .iter()
+        .map(|p| ApprovedOutput {
+            dest: match &p.dest {
+                PaymentDest::Sp(c) => ApprovedDest::sp(c),
+                PaymentDest::Script(s) => ApprovedDest::Script(s.clone()),
+            },
+            amount: p.amount,
+        })
+        .collect();
+    let mut fee = have - target;
+    if let Some(change) = change {
+        lens.push(script_len_of(change));
+        let fee_with_change = fee_rate_sat_vb * est_vsize(coins.len(), &lens);
+        let amount = have.saturating_sub(target + fee_with_change);
+        if amount >= DUST_CHANGE_SATS {
+            outputs.push(ApprovedOutput {
+                dest: match change {
+                    PaymentDest::Sp(c) => ApprovedDest::sp(c),
+                    PaymentDest::Script(s) => ApprovedDest::Script(s.clone()),
+                },
+                amount: Amount::from_sat(amount),
+            });
+            fee = fee_with_change;
+        }
+    }
+    if fee > fee_no_change.max(1) * MAX_BURN_FACTOR {
+        return Err(Error::Other(format!(
+            "the leftover {fee} sats would all go to fees (about {fee_no_change} needed); declare a change address"
+        )));
+    }
+    Ok(SendPlan {
+        approved: ApprovedSend {
+            inputs: resolved.iter().map(|r| r.outpoint).collect(),
+            outputs,
+            max_fee: Amount::from_sat(fee),
+        },
+        coins: coins.to_vec(),
+        fee: Amount::from_sat(fee),
+    })
+}
+
+/// A plan without change may leave at most this many times the estimated fee unspent.
+pub const MAX_BURN_FACTOR: u64 = 10;
+
 /// Run both rounds in process: `signers` are the cosigners, `signing_set` the ones used.
 pub fn execute_send<R: RngCore + CryptoRng>(
     coordinator: &SendCoordinator,

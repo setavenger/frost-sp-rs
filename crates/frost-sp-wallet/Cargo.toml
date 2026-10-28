@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 bitcoin.workspace = true
 bitcoinconsensus = "0.106"
-frost-secp256k1-tr = "3.0.0"
+frost-secp256k1-tr = "=3.0.0"
 rust-dleq.workspace = true
 k256 = "0.13"
 rand = { version = "0.8", features = ["std", "std_rng"] }
