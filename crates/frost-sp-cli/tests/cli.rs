@@ -303,7 +303,7 @@ fn keygen_writes_one_owner_only_file_per_device_and_prints_the_constants() {
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         let f = read_json(&path);
         assert_eq!(f["check_code"].as_str().unwrap(), code);
-        assert_eq!(f["test_only_seeded"], json!(true));
+        assert_eq!(f["test_only_seed"], json!(9));
     }
     // same seed, same keys; never overwrite a device file
     let (again, ok) = keygen(&dir, &["--seed", "9"]);
@@ -319,7 +319,7 @@ fn keygen_writes_one_owner_only_file_per_device_and_prints_the_constants() {
     assert!(ok, "{v3}");
     assert_ne!(v3["spend_pubkey"], v["spend_pubkey"]);
     assert!(v3.get("scan_secret").is_none() && v3.get("warning").is_none());
-    assert!(read_json(&p(&dir3, 1)).get("test_only_seeded").is_none());
+    assert!(read_json(&p(&dir3, 1)).get("test_only_seed").is_none());
     for d in [dir, dir2, dir3] {
         std::fs::remove_dir_all(d).unwrap();
     }
@@ -332,9 +332,61 @@ fn d10_keygen_refuses_bad_parameters_and_a_seed_on_mainnet() {
         let (v, ok) = run(&["keygen", "--n", n, "--t", t, "--out-dir", dir.to_str().unwrap()], &[], "");
         assert!(!ok && v["error"].as_str().unwrap().contains("threshold"), "{v}");
     }
+    for n in ["0", "1", "33"] {
+        let (v, ok) = run(&["keygen", "--n", n, "--t", "2", "--out-dir", dir.to_str().unwrap()], &[], "");
+        assert!(!ok && v["error"].as_str().unwrap().contains("devices: want 2 to 32"), "{v}");
+    }
     let (v, ok) = keygen(&dir, &["--seed", "1", "--network", "mainnet"]);
     assert!(!ok && v["error"].as_str().unwrap().contains("refused on mainnet"), "{v}");
+    // A flag without its value does not swallow the next flag.
+    let (v, ok) = run(&["keygen", "--n", "3", "--t", "2", "--seed", "--out-dir", dir.to_str().unwrap()], &[], "");
+    assert!(!ok && v["error"].as_str().unwrap().contains("--seed needs a value"), "{v}");
     assert!(!dir.exists(), "nothing written");
+}
+
+#[test]
+fn keygen_writes_no_file_unless_it_can_write_all_of_them() {
+    let dir = scratch("keygen-partial");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-2.json"), "taken").unwrap();
+    let (v, ok) = keygen(&dir, &[]);
+    assert!(!ok && v["error"].as_str().unwrap().contains("never overwrites"), "{v}");
+    assert!(!dir.join("device-1.json").exists() && !dir.join("device-3.json").exists());
+    assert_eq!(std::fs::read_to_string(dir.join("device-2.json")).unwrap(), "taken");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// The test mark cannot turn a real group into test data, and the signer keeps real device
+/// files owner-only and seeded ones off mainnet.
+#[test]
+fn test_marks_are_checked_and_real_device_files_stay_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("keygen-marks");
+    let (_, ok) = keygen(&dir, &[]);
+    assert!(ok);
+    // Mark a real group's files as seeded: reconstruction re-derives the group and refuses.
+    let forged: Vec<String> = (1..=2)
+        .map(|i| {
+            let mut f = read_json(&p(&dir, i));
+            f["test_only_seed"] = json!(352);
+            let path = dir.join(format!("forged-{i}.json"));
+            std::fs::write(&path, f.to_string()).unwrap();
+            path.to_str().unwrap().to_string()
+        })
+        .collect();
+    let (v, ok) = run(&["reconstruct-test-secret", "--state", &forged[0], "--state", &forged[1]], &[], "");
+    assert!(!ok && v["error"].as_str().unwrap().contains("do not come from their recorded test seed"), "{v}");
+    // A real device file readable by others is refused.
+    std::fs::set_permissions(p(&dir, 1), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (v, ok) = run(&["--state", &p(&dir, 1), "--state", &p(&dir, 2)], &wallet_env(""), "{}");
+    assert!(!ok && v["error"].as_str().unwrap().contains("readable by others"), "{v}");
+    std::fs::remove_dir_all(dir).unwrap();
+    // Seeded files on mainnet.
+    let mut env = wallet_env("");
+    env[0].1 = "mainnet".into();
+    let req = json!({"network": "mainnet", "destinations": [], "utxos": []}).to_string();
+    let (v, ok) = run(&["--state", &device(1), "--state", &device(2)], &env, &req);
+    assert!(!ok && v["error"].as_str().unwrap().contains("refused on mainnet"), "{v}");
 }
 
 /// D11: each file holds exactly one signing share, and no other device's share bytes.
@@ -444,7 +496,7 @@ fn reconstruct_test_secret_matches_the_group_key_and_only_for_seeded_groups() {
     let (v2, _) = run(&["reconstruct-test-secret", "--state", &device(2), "--state", &device(3)], &[], "");
     assert_eq!(v["group_secret_for_mock_signer"], v2["group_secret_for_mock_signer"]);
     let (v, ok) = run(&["reconstruct-test-secret", "--state", &device(2)], &[], "");
-    assert!(!ok && v["error"].as_str().unwrap().contains("need 2"), "{v}");
+    assert!(!ok && v["error"].as_str().unwrap().contains("threshold of 2"), "{v}");
     let dir = scratch("keygen-unseeded");
     let (_, ok) = keygen(&dir, &[]);
     assert!(ok);

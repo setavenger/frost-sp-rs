@@ -800,6 +800,10 @@ fn d10_bad_parameters_and_unknown_participants_are_refused() {
     assert!(matches!(Params::new(1, 3, three.clone()), Err(DkgError::Params(_))));
     assert!(matches!(Params::new(0, 3, three.clone()), Err(DkgError::Params(_))));
     assert!(matches!(Params::new(2, 3, vec![pk(1), pk(2)]), Err(DkgError::Params(_))));
+    assert!(matches!(Params::new(2, 1, vec![pk(1)]), Err(DkgError::Params(_))));
+    let many: Vec<PublicKey> = (1..=33).map(pk).collect();
+    assert!(matches!(Params::new(2, 33, many.clone()), Err(DkgError::Params(_))));
+    assert!(Params::new(2, 32, many[..32].to_vec()).is_ok());
     assert!(matches!(Params::new(2, 3, vec![pk(1), pk(2), pk(1)]), Err(DkgError::Params(_))));
     // Same x coordinate, other parity: one BIP 340 identity.
     assert!(matches!(Params::new(2, 3, vec![pk(1), pk(2), pk(1).negate(&secp)]), Err(DkgError::Params(_))));

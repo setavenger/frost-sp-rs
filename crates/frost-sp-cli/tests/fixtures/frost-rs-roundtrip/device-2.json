@@ -1,7 +1,7 @@
 {
   "format": "frost-sp-device/1",
   "warning": "TEST ONLY: made with keygen --seed. Every secret in this file follows from the seed. Never use it for real funds.",
-  "test_only_seeded": true,
+  "test_only_seed": 352,
   "identifier": 2,
   "min_signers": 2,
   "max_signers": 3,

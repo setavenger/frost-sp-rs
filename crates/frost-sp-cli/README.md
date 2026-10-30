@@ -44,8 +44,15 @@ frost-sp-signer reconstruct-test-secret --state keys/device-1.json --state keys/
   `{error}`: the input key sum would not contain the group key.
 * The request's `tweak` is ignored. `script_pubkey` and `value_sats` are cross-checked against
   the funding transaction.
-* `reconstruct-test-secret` only accepts files marked `test_only_seeded`; the signer never
-  reconstructs anything.
+* `reconstruct-test-secret` only accepts files marked `test_only_seed`, and re-derives the
+  group from that seed before trusting the mark; the signer never reconstructs anything. On
+  the signer path the mark is advisory (seeded files are refused on mainnet; unseeded files
+  must be mode 0600).
+* The check code is 48 bits of `H(T)`: enough for people comparing screens (the echo round and
+  the certificate already bind every device to one `T`), not a collision-resistant fingerprint.
+* Round-2 sealing uses the static host keys (static-static ECDH, as specified): no forward
+  secrecy; a later leak of a host key exposes that device's recorded round-2 traffic. The host
+  key also signs the device's messages and certificate. `n` is capped at 32 for the PoC.
 
 `tests/fixtures/frost-rs-roundtrip/device-{1,2,3}.json` are `keygen --n 3 --t 2 --seed 352`:
 the keys committed in the test kit's `scenarios/frost-rs-roundtrip.toml`. Test data.

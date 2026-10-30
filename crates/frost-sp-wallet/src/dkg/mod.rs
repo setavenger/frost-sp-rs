@@ -91,7 +91,9 @@ pub enum DkgError {
 }
 
 impl DkgError {
-    /// The participant this error blames, if exactly one is to blame.
+    /// The participant this error blames, if exactly one is to blame. Failures the untrusted
+    /// coordinator could have caused just as well (a message that does not authenticate,
+    /// duplicates, missing messages, echo or certificate mismatches) blame nobody.
     pub fn culprit(&self) -> Option<u16> {
         match self {
             DkgError::ProofOfKnowledge { culprit } | DkgError::SecretShare { culprit } => {
@@ -107,6 +109,9 @@ pub(crate) fn frost_err(e: frost_secp256k1_tr::Error) -> DkgError {
     DkgError::Frost(e.to_string())
 }
 
+/// PoC cap on `n`: the simulated ceremony and every load-time check grow with `n²`–`n³`.
+pub const MAX_PARTICIPANTS: u16 = 32;
+
 /// The participant list: `t`, `n` and the host public keys sorted by their 33-byte encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Params {
@@ -116,10 +121,14 @@ pub struct Params {
 }
 
 impl Params {
-    /// Refuses `t < 2`, `t > n`, a list that is not `n` keys long and duplicate host keys
-    /// (also two keys with one x coordinate: they would share BIP 340 signatures).
+    /// Refuses `n < 2`, `n > MAX_PARTICIPANTS`, `t < 2`, `t > n`, a list that is not `n` keys
+    /// long and duplicate host keys (also two keys with one x coordinate: they would share
+    /// BIP 340 signatures).
     pub fn new(t: u16, n: u16, mut hosts: Vec<PublicKey>) -> Result<Self, DkgError> {
         let bad = |m: String| Err(DkgError::Params(m));
+        if !(2..=MAX_PARTICIPANTS).contains(&n) {
+            return bad(format!("n = {n} devices: want 2 to {MAX_PARTICIPANTS}"));
+        }
         if t < 2 {
             return bad(format!("threshold t = {t} is below 2"));
         }

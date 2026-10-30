@@ -22,8 +22,7 @@ use frost_sp_cli::{
     load_devices, reconstruct_test_secret, run_keygen, sign_request, DeviceFile, Request,
     WalletEnv,
 };
-use rand::rngs::{OsRng, StdRng};
-use rand::{RngCore, SeedableRng};
+use rand::rngs::OsRng;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -53,7 +52,10 @@ fn parse(args: &[String], allowed: &[&str]) -> Result<Vec<(String, String)>, Str
         if !allowed.contains(&a.as_str()) {
             return Err(format!("unexpected argument {a:?}"));
         }
-        let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
+        let v = it
+            .next()
+            .filter(|v| !v.starts_with("--"))
+            .ok_or_else(|| format!("{a} needs a value"))?;
         out.push((a.clone(), v.clone()));
     }
     Ok(out)
@@ -84,25 +86,18 @@ fn keygen(args: &[String]) -> Result<String, String> {
     let t: u16 = number(&p, "--t")?.ok_or("keygen needs --t <threshold>")?;
     let dir = one(&p, "--out-dir")?.ok_or("keygen needs --out-dir <dir>")?;
     let network = one(&p, "--network")?.unwrap_or_else(|| "regtest".into());
-    let seed: Option<u64> = number(&p, "--seed")?;
     // --seed: reproducible test constants. Every secret then follows from the seed.
-    let mut rng: Box<dyn RngCore> = match seed {
-        Some(s) => Box::new(StdRng::seed_from_u64(s)),
-        None => Box::new(OsRng),
-    };
-    struct Dyn<'a>(&'a mut dyn RngCore);
-    impl RngCore for Dyn<'_> {
-        fn next_u32(&mut self) -> u32 { self.0.next_u32() }
-        fn next_u64(&mut self) -> u64 { self.0.next_u64() }
-        fn fill_bytes(&mut self, d: &mut [u8]) { self.0.fill_bytes(d) }
-        fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), rand::Error> { self.0.try_fill_bytes(d) }
+    let seed: Option<u64> = number(&p, "--seed")?;
+    let (files, out) = run_keygen(t, n, &network, seed)?;
+    // Never overwrite a device file, and write none unless all of them can be written.
+    let paths: Vec<_> = out.devices.iter().map(|d| Path::new(&dir).join(&d.file)).collect();
+    if let Some(taken) = paths.iter().find(|p| p.exists()) {
+        return Err(format!("{}: exists (keygen never overwrites a device file)", taken.display()));
     }
-    impl rand::CryptoRng for Dyn<'_> {}
-    let (files, out) = run_keygen(t, n, &network, seed.is_some(), &mut Dyn(rng.as_mut()))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
-    for (f, d) in files.iter().zip(&out.devices) {
+    for (f, path) in files.iter().zip(&paths) {
         let json = serde_json::to_string_pretty(f).map_err(|e| e.to_string())?;
-        write_private(&Path::new(&dir).join(&d.file), &(json + "\n"))?;
+        write_private(path, &(json + "\n"))?;
     }
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())
 }
@@ -135,8 +130,17 @@ fn state_files(p: &[(String, String)]) -> Result<Vec<DeviceFile>, String> {
     paths
         .iter()
         .map(|path| {
+            use std::os::unix::fs::PermissionsExt;
             let text = std::fs::read_to_string(path).map_err(|e| format!("state file {path}: {e}"))?;
-            serde_json::from_str(&text).map_err(|e| format!("state file {path}: {e}"))
+            let file: DeviceFile =
+                serde_json::from_str(&text).map_err(|e| format!("state file {path}: {e}"))?;
+            // A real device file holds a signing share: owner-only. (Seeded test fixtures are
+            // exempt: git checks them out 0644.)
+            let mode = std::fs::metadata(path).map_err(|e| format!("state file {path}: {e}"))?.permissions().mode();
+            if file.test_only_seed.is_none() && mode & 0o077 != 0 {
+                return Err(format!("state file {path}: readable by others (mode {:o}); chmod 600 it", mode & 0o777));
+            }
+            Ok(file)
         })
         .collect()
 }
@@ -144,17 +148,14 @@ fn state_files(p: &[(String, String)]) -> Result<Vec<DeviceFile>, String> {
 fn reconstruct(args: &[String]) -> Result<String, String> {
     let p = parse(args, &["--state"])?;
     let files = state_files(&p)?;
-    if !files.iter().all(|f| f.test_only_seeded) {
-        return Err("reconstruct-test-secret only accepts device files of a seeded test group".into());
-    }
-    let keys = load_devices(&files)?;
-    serde_json::to_string_pretty(&reconstruct_test_secret(&keys)?).map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&reconstruct_test_secret(&files)?).map_err(|e| e.to_string())
 }
 
 fn sign(args: &[String]) -> Result<String, String> {
     let p = parse(args, &["--state"])?;
     let files = state_files(&p)?;
-    let seeded = files.iter().any(|f| f.test_only_seeded);
+    // Advisory: the mark is self-declared on this path, so it only catches honest mistakes.
+    let seeded = files.iter().any(|f| f.test_only_seed.is_some());
     let devices = load_devices(&files)?;
     let env = WalletEnv::from_env(|k| std::env::var(k).ok())?;
     let mut stdin = String::new();

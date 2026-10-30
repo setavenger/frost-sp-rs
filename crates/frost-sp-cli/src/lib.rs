@@ -23,7 +23,8 @@ use frost_sp_wallet::send::{
 };
 use frost_sp_wallet::spend::Signer;
 use frost_sp_wallet::wallet::SpWallet;
-use rand::{CryptoRng, RngCore};
+use rand::rngs::{OsRng, StdRng};
+use rand::{CryptoRng, RngCore, SeedableRng};
 use secp256k1::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use silentpayments::{Network as SpNetwork, SilentPaymentCode};
@@ -64,8 +65,10 @@ pub struct CertificateFile {
 pub struct DeviceFile {
     pub format: String,
     pub warning: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub test_only_seeded: bool,
+    /// Set by `keygen --seed`: every secret follows from this seed. `reconstruct-test-secret`
+    /// re-derives the group from it before trusting it; elsewhere it is an advisory mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_only_seed: Option<u64>,
     pub identifier: u16,
     pub min_signers: u16,
     pub max_signers: u16,
@@ -85,13 +88,13 @@ pub struct DeviceFile {
 }
 
 impl DeviceFile {
-    pub fn from_key(k: &DeviceKey, seeded: bool) -> Result<Self, String> {
+    pub fn from_key(k: &DeviceKey, seed: Option<u64>) -> Result<Self, String> {
         let e = |x: &dyn std::fmt::Display| x.to_string();
         let c = k.certificate();
         Ok(Self {
             format: DEVICE_FORMAT.into(),
-            warning: if seeded { SEEDED_WARNING } else { DEVICE_WARNING }.into(),
-            test_only_seeded: seeded,
+            warning: if seed.is_some() { SEEDED_WARNING } else { DEVICE_WARNING }.into(),
+            test_only_seed: seed,
             identifier: k.identifier(),
             min_signers: k.params().t(),
             max_signers: k.params().n(),
@@ -204,24 +207,33 @@ pub fn networks(name: &str) -> Result<(SpNetwork, bitcoin::Network), String> {
     }
 }
 
-/// Run the simulated ceremony and describe its result. `seeded` marks the files test-only.
-pub fn run_keygen<R: RngCore + CryptoRng>(
+/// The simulated ceremony: fresh randomness, or (test only) everything from `seed`.
+fn ceremony(t: u16, n: u16, seed: Option<u64>) -> Result<Vec<DeviceKey>, String> {
+    match seed {
+        Some(s) => keygen(t, n, &mut StdRng::seed_from_u64(s)),
+        None => keygen(t, n, &mut OsRng),
+    }
+    .map_err(|x| format!("key generation failed: {x}"))
+}
+
+/// Run the simulated ceremony and describe its result. A `seed` marks the files test-only.
+pub fn run_keygen(
     t: u16,
     n: u16,
     network: &str,
-    seeded: bool,
-    rng: &mut R,
+    seed: Option<u64>,
 ) -> Result<(Vec<DeviceFile>, KeygenOutput), String> {
     let e = |x: &dyn std::fmt::Display| x.to_string();
+    let seeded = seed.is_some();
     let (sp_net, _) = networks(network)?;
     if seeded && sp_net == SpNetwork::Mainnet {
         return Err("--seed is test-only and refused on mainnet".into());
     }
-    let keys = keygen(t, n, rng).map_err(|x| format!("key generation failed: {x}"))?;
+    let keys = ceremony(t, n, seed)?;
     let mut files = vec![];
     let mut devices = vec![];
     for k in &keys {
-        files.push(DeviceFile::from_key(k, seeded)?);
+        files.push(DeviceFile::from_key(k, seed)?);
         devices.push(KeygenDevice {
             identifier: k.identifier(),
             file: format!("device-{}.json", k.identifier()),
@@ -243,9 +255,18 @@ pub fn run_keygen<R: RngCore + CryptoRng>(
     Ok((files, out))
 }
 
-/// Load the devices taking part in one signing run. Refuses duplicate identifiers and devices
-/// from different ceremonies (group key or certificate differ).
+/// Load the devices taking part in one run (at least `t`). Refuses duplicate identifiers and
+/// devices from different ceremonies (group key or certificate differ).
 pub fn load_devices(files: &[DeviceFile]) -> Result<Vec<DeviceKey>, String> {
+    let keys = load_each(files)?;
+    let t = keys.first().map_or(0, |k| k.params().t());
+    if keys.len() < usize::from(t) {
+        return Err(format!("{} device files for a threshold of {t}", keys.len()));
+    }
+    Ok(keys)
+}
+
+fn load_each(files: &[DeviceFile]) -> Result<Vec<DeviceKey>, String> {
     let mut keys: Vec<DeviceKey> = vec![];
     for f in files {
         let k = f.load()?;
@@ -274,13 +295,20 @@ pub struct TestSecretOutput {
     pub group_secret_for_mock_signer: String,
 }
 
-/// **Test only.** Reconstruct `x` from `t` devices of a *seeded* (test) group and check
-/// `x·G == X`. Never used by the signer.
-pub fn reconstruct_test_secret(keys: &[DeviceKey]) -> Result<TestSecretOutput, String> {
+/// **Test only.** Reconstruct `x` from `t` device files of a *seeded* (test) group and check
+/// `x·G == X`. The group must re-derive from the recorded seed, so a real group's files cannot
+/// be passed off as test data by editing the mark. Never used by the signer.
+pub fn reconstruct_test_secret(files: &[DeviceFile]) -> Result<TestSecretOutput, String> {
     let e = |x: &dyn std::fmt::Display| x.to_string();
+    let keys = load_devices(files)?;
     let first = keys.first().ok_or("no device files")?;
-    if keys.len() < usize::from(first.params().t()) {
-        return Err(format!("need {} device files", first.params().t()));
+    let seed = files[0].test_only_seed;
+    if seed.is_none() || files.iter().any(|f| f.test_only_seed != seed) {
+        return Err("reconstruct-test-secret only accepts device files of one seeded test group".into());
+    }
+    let again = ceremony(first.params().t(), first.params().n(), seed)?;
+    if again.first().map(DeviceKey::certificate) != Some(first.certificate()) {
+        return Err("these device files do not come from their recorded test seed".into());
     }
     let kps: Vec<KeyPackage> = keys.iter().map(|k| k.key_package().clone()).collect();
     let x = frost_secp256k1_tr::keys::reconstruct(&kps).map_err(|x| e(&x))?;
