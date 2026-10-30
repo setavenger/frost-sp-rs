@@ -3,7 +3,7 @@ name = "frost-sp-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "PoC external signer (frost-sp-signer) for the BlindBit test kit: a t-of-n FROST Silent Payment wallet, all key packages in one process. PoC ONLY."
+description = "PoC external signer (frost-sp-signer) for the BlindBit test kit: a t-of-n FROST Silent Payment wallet with DKG-generated device files, one signing share each. PoC ONLY."
 
 [[bin]]
 name = "frost-sp-signer"

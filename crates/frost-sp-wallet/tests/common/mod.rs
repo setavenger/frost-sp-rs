@@ -284,8 +284,15 @@ pub struct Env {
     pub labels: Vec<u32>,
 }
 
+/// A 2-of-3 group from the simulated DKG (seeded): each share was made on its own device and
+/// `b_scan` drawn by device 1. Tests gather the key packages to drive all cosigners at once.
+pub fn dkg_group(seed: u64) -> FrostGroup {
+    let keys = frost_sp_wallet::dkg::keygen(2, 3, &mut rng(seed)).unwrap();
+    FrostGroup::from_device_keys(&keys).unwrap()
+}
+
 pub fn env(seed: u64, labels: &[u32]) -> Env {
-    let group = FrostGroup::trusted_dealer(3, 2, sk_from_seed(seed, "scan"), &mut rng(seed)).unwrap();
+    let group = dkg_group(seed);
     let signers = make_signers(&group, Network::Regtest, labels);
     let mut w = SpWallet::new(group.b_scan, group.b_spend().unwrap(), Network::Regtest).unwrap();
     for m in labels {

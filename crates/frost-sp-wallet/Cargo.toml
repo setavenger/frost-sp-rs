@@ -4,22 +4,32 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Trusted-dealer group setup (`FrostGroup::trusted_dealer`/`from_secret`). Test-only: the BIP 352
+# vectors fix `b_spend`, which a DKG cannot produce. Never enabled by the CLI.
+test-dealer = []
+
 [dependencies]
 bitcoin.workspace = true
 bitcoinconsensus = "0.106"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 frost-secp256k1-tr = "=3.0.0"
+hkdf = "0.12"
 rust-dleq.workspace = true
 k256 = "0.13"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 secp256k1.workspace = true
+sha2.workspace = true
 silentpayments.workspace = true
 thiserror.workspace = true
+zeroize = "1"
 
 [dev-dependencies]
+# The integration tests for the BIP 352 vectors need the test-only dealer.
+frost-sp-wallet = { path = ".", features = ["test-dealer"] }
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 
 [lints]
 workspace = true
