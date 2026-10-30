@@ -50,8 +50,8 @@ fn payout() -> ScriptBuf {
 
 /// Fund `label` (None = base address, Some(m) = labelled/change) from the given inputs.
 fn world(seed: u64, label: Option<u32>, kinds: &[InputKind]) -> World {
-    let b_scan = sk_from_seed(seed, "scan");
-    let group = FrostGroup::trusted_dealer(3, 2, b_scan, &mut rng(seed)).unwrap();
+    let group = dkg_group(seed);
+    let b_scan = group.b_scan;
     let mut wallet = SpWallet::new(b_scan, group.b_spend().unwrap(), NET).unwrap();
     if let Some(m) = label.filter(|m| *m != 0) {
         wallet.add_label(m).unwrap();
@@ -440,7 +440,7 @@ fn invalid_p2tr_shaped_output_does_not_block_scanning() {
             script_pubkey: ScriptBuf::from_bytes(spk),
         },
     );
-    let wallet = SpWallet::new(sk_from_seed(33, "scan"), w.group.b_spend().unwrap(), NET).unwrap();
+    let wallet = SpWallet::new(w.group.b_scan, w.group.b_spend().unwrap(), NET).unwrap();
     let owned = wallet
         .scan_tx(&w.funding.tx, &w.funding.prevout_spks)
         .unwrap();
@@ -495,7 +495,7 @@ fn f2_approved_outpoint_is_checked_before_scanning() {
 #[test]
 fn f3_tx_spending_segwit_v2_output_is_not_scanned() {
     let mut w = world(62, None, &[InputKind::P2wpkh]);
-    let wallet = SpWallet::new(sk_from_seed(62, "scan"), w.group.b_spend().unwrap(), NET).unwrap();
+    let wallet = SpWallet::new(w.group.b_scan, w.group.b_spend().unwrap(), NET).unwrap();
     assert_eq!(wallet.scan_tx(&w.funding.tx, &w.funding.prevout_spks).unwrap().len(), 1);
     let mut v2 = vec![0x52, 0x20];
     v2.extend([0x42u8; 32]);

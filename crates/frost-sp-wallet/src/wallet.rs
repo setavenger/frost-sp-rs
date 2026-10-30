@@ -219,7 +219,7 @@ impl SpWallet {
     }
 }
 
-fn tagged_hash(tag: &str, parts: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn tagged_hash(tag: &str, parts: &[&[u8]]) -> [u8; 32] {
     use bitcoin::hashes::HashEngine;
     let th = sha256::Hash::hash(tag.as_bytes());
     let mut e = sha256::Hash::engine();

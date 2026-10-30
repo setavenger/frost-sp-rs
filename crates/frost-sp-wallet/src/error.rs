@@ -20,6 +20,8 @@ pub enum Error {
     ParityCancellation,
     #[error("invalid scan key: {0}")]
     InvalidScanKey(&'static str),
+    #[error("key generation: {0}")]
+    Dkg(#[from] crate::dkg::DkgError),
     #[error("{0}")]
     Other(String),
 }

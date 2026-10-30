@@ -3,20 +3,38 @@
 External signer for the BlindBit test kit (`docs/external-signer.md` in `blindbit-testkit`,
 PR #28) backed by a `t`-of-`n` FROST Silent Payment wallet (`frost-sp-wallet`).
 
-**PoC only.** The state file holds *every* key package (trusted dealer) and one process plays
-all cosigners. The protocol code is the real one (threshold ECDH + BIP 374 proofs, FROST
-rounds per input under `X + tau_j*G`, every signer re-deriving `tau_j` from the funding
-transaction), but a deployment needs one key package per machine, DKG instead of a dealer, and
-a persisted exposure counter.
+Keys come from a **distributed key generation** (`frost_sp_wallet::dkg`), not a dealer:
+
+* `keygen` runs a simulated ceremony between `n` devices: ZF's Pedersen DKG with proofs of
+  knowledge, an echo round so every device saw the same commitments, round-2 shares sealed
+  device to device (ECDH host keys → HKDF-SHA256 → ChaCha20-Poly1305), `b_scan` drawn by
+  device 1, and a certificate: every device signs the transcript hash `T` with its host key and
+  accepts only with all `n` signatures on its own `T`.
+* It writes one file per device (`device-<i>.json`, mode 0600, never overwritten). Each holds
+  exactly **one** signing share, the group's public key package, `b_scan`, the device's host
+  key and the certificate. Each device shows a check code (from `T`) and the SP address for the
+  user to compare.
+* The signer takes `--state` once per participating device (at least `t`). Each file is fully
+  re-verified on load (certificate, key material, `X_i == x_i·G`) and goes into its own
+  cosigner; files with the same identifier, another group key or another certificate are
+  refused.
+
+**PoC:** the devices of one ceremony, and the cosigners of one signing run, share a process.
+Their state, secrets and messages are separate, but there is no real transport, the exposure
+counter is not persisted, and there is no recovery backup.
 
 ```
-# one-off: write the state file, print the scenario constants (seeded = reproducible)
-frost-sp-signer dealer --out state.json --seed 352 --print-group-secret
+# one-off: the ceremony (seeded = reproducible TEST constants; refused on mainnet)
+frost-sp-signer keygen --n 3 --t 2 --out-dir keys/ --seed 352
 
 # per spend (what the test kit does): wallet config in env, request on stdin
 BLINDBIT_SIGNER_NETWORK=regtest BLINDBIT_SIGNER_SCAN_SECRET=... \
 BLINDBIT_SIGNER_SPEND_PUBKEY=... BLINDBIT_SIGNER_LABELS=7 \
-  frost-sp-signer --state state.json [--signing-set 2,3] < request.json   # {"tx_hex"} or {"error"}
+  frost-sp-signer --state keys/device-1.json --state keys/device-3.json < request.json
+  # {"tx_hex"} or {"error"}
+
+# TEST ONLY, for the test kit's single-key mock signer: x from t files of a seeded group
+frost-sp-signer reconstruct-test-secret --state keys/device-1.json --state keys/device-2.json
 ```
 
 * **Spend exactly these coins**, in the order given. Payments are paid in order, then change.
@@ -26,8 +44,8 @@ BLINDBIT_SIGNER_SPEND_PUBKEY=... BLINDBIT_SIGNER_LABELS=7 \
   `{error}`: the input key sum would not contain the group key.
 * The request's `tweak` is ignored. `script_pubkey` and `value_sats` are cross-checked against
   the funding transaction.
-* `--print-group-secret` also prints the reconstructed secret so the same scenario can run with
-  the test kit's single-key mock signer. Test constants only.
+* `reconstruct-test-secret` only accepts files marked `test_only_seeded`; the signer never
+  reconstructs anything.
 
-`tests/fixtures/frost-rs-roundtrip-state.json` is the dealer's output for the keys committed in
-`scenarios/frost-rs-roundtrip.toml`; it holds all key packages and is test data.
+`tests/fixtures/frost-rs-roundtrip/device-{1,2,3}.json` are `keygen --n 3 --t 2 --seed 352`:
+the keys committed in the test kit's `scenarios/frost-rs-roundtrip.toml`. Test data.
