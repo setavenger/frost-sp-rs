@@ -419,6 +419,7 @@ fn t5_wrong_tweak_from_coordinator() {
     let mut req = st.request(&st.tx, &st.shares, &st.packages);
     req.coordinator_tau_hints = Some(hints);
     for r in all_refuse(&mut a, &st, &req) {
+        println!("REFUSAL t5_wrong_tweak_from_coordinator: {r}");
         assert!(r.contains("tweak for input 2"), "{r}");
     }
 }

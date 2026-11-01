@@ -196,6 +196,7 @@ fn refuses_inputs_whose_parities_cancel() {
     );
     assert!(!ok);
     let err = v["error"].as_str().unwrap();
+    println!("REFUSAL refuses_inputs_whose_parities_cancel: {err}");
     assert!(err.contains("sum of parities 0"), "{err}");
     assert!(v.get("tx_hex").is_none());
 }
@@ -448,6 +449,7 @@ fn d9_signer_refuses_a_state_file_without_a_valid_certificate() {
     let mut f = good.clone();
     f.as_object_mut().unwrap().remove("certificate");
     let (v, ok) = try_file("no-cert.json", &f);
+    println!("REFUSAL d9_signer_refuses_a_state_file_without_a_valid_certificate (no certificate): {}", v["error"]);
     assert!(!ok && v["error"].as_str().unwrap().contains("missing field `certificate`"), "{v}");
     // one signature flipped
     let mut f = good.clone();
@@ -455,16 +457,19 @@ fn d9_signer_refuses_a_state_file_without_a_valid_certificate() {
     let flipped = format!("{}{}", if sig.starts_with('0') { "1" } else { "0" }, &sig[1..]);
     f["certificate"]["signatures"]["3"] = json!(flipped);
     let (v, ok) = try_file("bad-sig.json", &f);
+    println!("REFUSAL d9_signer_refuses_a_state_file_without_a_valid_certificate (flipped signature): {}", v["error"]);
     assert!(!ok && v["error"].as_str().unwrap().contains("certificate"), "{v}");
     // a signature removed
     let mut f = good.clone();
     f["certificate"]["signatures"].as_object_mut().unwrap().remove("2");
     let (v, ok) = try_file("short-cert.json", &f);
+    println!("REFUSAL d9_signer_refuses_a_state_file_without_a_valid_certificate (signature removed): {}", v["error"]);
     assert!(!ok && v["error"].as_str().unwrap().contains("no signature from [2]"), "{v}");
     // the key package swapped for another device's
     let mut f = good.clone();
     f["key_package"] = read_json(&device(2))["key_package"].clone();
     let (v, ok) = try_file("other-share.json", &f);
+    println!("REFUSAL d9_signer_refuses_a_state_file_without_a_valid_certificate (swapped key package): {}", v["error"]);
     assert!(!ok, "{v}");
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -304,6 +304,7 @@ fn d2_bad_proof_of_knowledge_names_the_culprit() {
         }),
     );
     for id in [1, 3] {
+        println!("REFUSAL d2_bad_proof_of_knowledge_names_the_culprit: device {id}: {:?}", out.error(id));
         assert_eq!(out.error(id), Some(&DkgError::ProofOfKnowledge { culprit: 2 }));
         assert_eq!(out.error(id).unwrap().culprit(), Some(2));
     }
@@ -393,6 +394,7 @@ fn d4_equivocation_is_caught_by_the_echo_before_any_share_is_sent() {
         }
     });
     for id in 1..=3 {
+        println!("REFUSAL d4_equivocation_is_caught_by_the_echo_before_any_share_is_sent: device {id}: {:?}", out.error(id));
         assert!(matches!(out.error(id), Some(DkgError::ViewMismatch(_))), "{id}: {:?}", out.error(id));
     }
     assert_eq!(out.error(1), Some(&DkgError::ViewMismatch(vec![3])));
@@ -524,6 +526,7 @@ fn d5_flipped_ciphertext_bit_fails_authentication() {
             }
         }
     });
+    println!("REFUSAL d5_flipped_ciphertext_bit_fails_authentication: device 2: {:?}", out.error(2));
     assert_eq!(out.error(2), Some(&DkgError::Decrypt { sender: 1 }));
     assert!(!out.log.iter().any(|m| m.round == Round::Certify && m.from == 2));
     none_accepted(&out);
@@ -714,6 +717,7 @@ fn d9_missing_or_forged_certificate_signature_means_no_acceptance() {
             msgs.retain(|m| !(m.from == 2 && m.to == 1));
         }
     });
+    println!("REFUSAL d9_missing_or_forged_certificate_signature_means_no_acceptance: missing signature, device 1: {:?}", out.error(1));
     assert_eq!(out.error(1), Some(&DkgError::Missing(vec![2])));
     // Device 3 signs some other transcript (a well-formed, host-signed message).
     let cheater = s.host(3);
@@ -727,6 +731,7 @@ fn d9_missing_or_forged_certificate_signature_means_no_acceptance() {
             }
         }
     });
+    println!("REFUSAL d9_missing_or_forged_certificate_signature_means_no_acceptance: forged signature, device 1: {:?}", out.error(1));
     assert!(matches!(out.error(1), Some(DkgError::Certificate(_))), "{:?}", out.error(1));
     assert!(out.results[&1].is_err());
 }
@@ -750,19 +755,31 @@ fn d9_a_stored_key_with_a_bad_certificate_does_not_load() {
     rebuild(k.certificate().clone(), k.public_key_package()).unwrap();
     let mut c = k.certificate().clone();
     c.signatures.get_mut(&3).unwrap()[10] ^= 1;
-    assert!(matches!(rebuild(c, k.public_key_package()), Err(DkgError::Certificate(_))));
+    let r = rebuild(c, k.public_key_package());
+    println!("REFUSAL d9_a_stored_key_with_a_bad_certificate_does_not_load: flipped signature: {:?}", r.as_ref().err());
+    assert!(matches!(r, Err(DkgError::Certificate(_))));
     let mut c = k.certificate().clone();
     c.signatures.remove(&1);
-    assert!(matches!(rebuild(c, k.public_key_package()), Err(DkgError::Certificate(_))));
+    let r = rebuild(c, k.public_key_package());
+    println!("REFUSAL d9_a_stored_key_with_a_bad_certificate_does_not_load: signature removed: {:?}", r.as_ref().err());
+    assert!(matches!(r, Err(DkgError::Certificate(_))));
     let mut c = k.certificate().clone();
     c.transcript_hash[0] ^= 1;
-    assert!(matches!(rebuild(c, k.public_key_package()), Err(DkgError::Certificate(_))));
+    let r = rebuild(c, k.public_key_package());
+    println!("REFUSAL d9_a_stored_key_with_a_bad_certificate_does_not_load: altered transcript hash: {:?}", r.as_ref().err());
+    assert!(matches!(r, Err(DkgError::Certificate(_))));
     let mut c = k.certificate().clone();
     c.session_nonce[0] ^= 1;
-    assert!(matches!(rebuild(c, k.public_key_package()), Err(DkgError::Certificate(_))));
+    let r = rebuild(c, k.public_key_package());
+    println!("REFUSAL d9_a_stored_key_with_a_bad_certificate_does_not_load: altered session nonce: {:?}", r.as_ref().err());
+    assert!(matches!(r, Err(DkgError::Certificate(_))));
     // Another ceremony's public key package or certificate.
-    assert!(rebuild(k.certificate().clone(), other[1].public_key_package()).is_err());
-    assert!(rebuild(other[1].certificate().clone(), k.public_key_package()).is_err());
+    let r = rebuild(k.certificate().clone(), other[1].public_key_package());
+    println!("REFUSAL d9_a_stored_key_with_a_bad_certificate_does_not_load: other ceremony's key package: {:?}", r.as_ref().err());
+    assert!(r.is_err());
+    let r = rebuild(other[1].certificate().clone(), k.public_key_package());
+    println!("REFUSAL d9_a_stored_key_with_a_bad_certificate_does_not_load: other ceremony's certificate: {:?}", r.as_ref().err());
+    assert!(r.is_err());
     // Another device's host key.
     let wrong_host = DeviceKey::from_parts(
         k.identifier(),
@@ -773,6 +790,7 @@ fn d9_a_stored_key_with_a_bad_certificate_does_not_load() {
         *k.b_scan(),
         k.certificate().clone(),
     );
+    println!("REFUSAL d9_a_stored_key_with_a_bad_certificate_does_not_load: other device's host key: {:?}", wrong_host.as_ref().err());
     assert!(matches!(wrong_host, Err(DkgError::KeyCheck(_))));
     // A different scan key.
     let wrong_scan = DeviceKey::from_parts(
@@ -784,6 +802,7 @@ fn d9_a_stored_key_with_a_bad_certificate_does_not_load() {
         *other[1].b_scan(),
         k.certificate().clone(),
     );
+    println!("REFUSAL d9_a_stored_key_with_a_bad_certificate_does_not_load: different scan key: {:?}", wrong_scan.as_ref().err());
     assert!(matches!(wrong_scan, Err(DkgError::Certificate(_))));
 }
 

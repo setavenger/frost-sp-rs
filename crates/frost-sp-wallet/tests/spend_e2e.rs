@@ -249,10 +249,9 @@ fn t7_wrong_coordinator_tweak_is_refused() {
     let mut s = session(&w, tx, None);
     let mut wrong = w.owned.tau;
     wrong[31] ^= 1;
-    assert_refused(
-        try_sign(&w, &mut s, |r| r.coordinator_tau_hint = Some(wrong)),
-        "tweak",
-    );
+    let result = try_sign(&w, &mut s, |r| r.coordinator_tau_hint = Some(wrong));
+    println!("REFUSAL t7_wrong_coordinator_tweak_is_refused: {:?}", result);
+    assert_refused(result, "tweak");
 }
 
 #[test]
