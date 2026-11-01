@@ -410,6 +410,51 @@ pub fn resolve_input(wallet: &SpWallet, src: &InputSource) -> Result<ResolvedInp
     })
 }
 
+/// `FROST_SP_TRACE` only: what the wallet re-derives for one coin (T7) and whether a tweak the
+/// caller handed in (`t_k + l_m`, hex) matches it. The handed tweak is never used.
+pub fn trace_input(wallet: &SpWallet, src: &InputSource, handed_tweak: Option<&str>) {
+    use crate::trace::hex;
+    let owned = wallet
+        .scan_tx(&src.funding_tx, &src.funding_prevout_spks)
+        .ok()
+        .and_then(|v| v.into_iter().find(|o| o.outpoint.vout == src.funding_vout));
+    let resolved = resolve_input(wallet, src);
+    // t_k = tau - l_m (l_m = 0 unlabelled).
+    let t_k = owned.as_ref().and_then(|o| {
+        let l = match o.label {
+            Some(m) => {
+                let l = silentpayments::receiving::Label::new(*wallet.b_scan(), m);
+                scalar_from_be(&l.as_inner().to_be_bytes()).ok()?
+            }
+            None => Scalar::ZERO,
+        };
+        Some(hex((scalar_from_be(&o.tau).ok()? - l).to_bytes()))
+    });
+    let tweak = owned.as_ref().map(|o| hex(o.tau));
+    let txo = src.funding_tx.output.get(src.funding_vout as usize);
+    crate::trace::emit(
+        "spend.input",
+        serde_json::json!({
+            "outpoint": OutPoint { txid: src.funding_tx.compute_txid(), vout: src.funding_vout }.to_string(),
+            "value_sats": txo.map(|o| o.value.to_sat()),
+            "script_pubkey": txo.map(|o| hex(o.script_pubkey.as_bytes())),
+            "t_k": t_k,
+            "label_m": owned.as_ref().and_then(|o| o.label),
+            "tweak_t_k_plus_l_m": tweak,
+            "p_k": resolved.as_ref().ok().map(|r| hex(r.point.serialize())),
+            "p_k_matches_script_pubkey": resolved.is_ok(),
+            "g": resolved.as_ref().ok().map(|r| r.g),
+            "handed_tweak": handed_tweak,
+            "handed_tweak_matches": handed_tweak.map(|h| Some(h.trim().to_ascii_lowercase()) == tweak),
+            "error": resolved.as_ref().err().map(ToString::to_string),
+        }),
+    );
+}
+
+fn id_u16(id: &Identifier) -> Option<u16> {
+    crate::dkg::index_of(id).ok()
+}
+
 fn resolve_all(wallet: &SpWallet, srcs: &[InputSource]) -> Result<Vec<ResolvedInput>> {
     let r = srcs
         .iter()
@@ -735,6 +780,19 @@ impl Signer {
             .map(|k| make_ecdh_share(&self.key_package, k, rng))
             .collect::<Result<Vec<_>>>()?;
         self.exposure.record_release(&keys);
+        for s in shares.iter().filter(|_| crate::trace::enabled()) {
+            use crate::trace::hex;
+            crate::trace::emit(
+                "send.ecdh_share",
+                serde_json::json!({
+                    "device": self.name,
+                    "identifier": id_u16(&s.id),
+                    "scan_key": hex(s.scan_key.serialize()),
+                    "d_i": hex(s.d.serialize()),
+                    "dleq_proof": hex(s.proof),
+                }),
+            );
+        }
         Ok(shares)
     }
 
@@ -865,6 +923,32 @@ impl Signer {
             }
         }
 
+        if crate::trace::enabled() {
+            use crate::trace::hex;
+            crate::trace::emit(
+                "send.signer_checks",
+                serde_json::json!({
+                    "device": self.name,
+                    "identifier": id_u16(self.key_package.identifier()),
+                    "signing_set": set.iter().map(id_u16).collect::<Vec<_>>(),
+                    "dleq_proofs_verified": req.ecdh_shares.iter().map(|s| serde_json::json!({
+                        "from": id_u16(&s.id),
+                        "scan_key": hex(s.scan_key.serialize()),
+                        "d_i": hex(s.d.serialize()),
+                    })).collect::<Vec<_>>(),
+                    "passed": [
+                        "inputs are the approved coins; every tweak re-derived from its funding tx",
+                        "parity guard (sum g != 0)",
+                        "public key package: sum lambda_i*X_i = X for the signing set",
+                        "every DLEQ proof verifies against X_i",
+                        "every output script recomputed and equal; amounts as approved",
+                        "fee within the approved maximum",
+                        "each FROST message is its input's sighash",
+                    ],
+                }),
+            );
+        }
+
         // 5. Sign every input under its own tweak.
         let mut shares = Vec::with_capacity(n);
         for j in 0..n {
@@ -945,7 +1029,7 @@ impl SendCoordinator {
             self.wallet.b_scan(),
         )?;
         let scripts = derive_scripts(outputs, &ecdh)?;
-        Ok(Transaction {
+        let tx = Transaction {
             version: transaction::Version::TWO,
             // Privacy fingerprint (review F4, accepted for the PoC): locktime is always 0.
             lock_time: absolute::LockTime::ZERO,
@@ -966,7 +1050,77 @@ impl SendCoordinator {
                     script_pubkey,
                 })
                 .collect(),
-        })
+        };
+        if crate::trace::enabled() {
+            self.trace_tx(&tx, &resolved, &ctx, signing_set, outputs, &ecdh);
+        }
+        Ok(tx)
+    }
+
+    /// `FROST_SP_TRACE`: the per-transaction sender math as the coordinator computed it.
+    fn trace_tx(
+        &self,
+        tx: &Transaction,
+        resolved: &[ResolvedInput],
+        ctx: &SenderContext,
+        signing_set: &[Identifier],
+        outputs: &[ApprovedOutput],
+        ecdh: &BTreeMap<[u8; 33], PublicKey>,
+    ) {
+        use crate::trace::hex;
+        use serde_json::json;
+        let own = self.wallet.b_scan().public_key(&Secp256k1::new()).serialize();
+        let lambdas: serde_json::Map<String, serde_json::Value> = lagrange_at_zero(signing_set)
+            .map(|m| m.iter().map(|(id, l)| (id_u16(id).unwrap_or_default().to_string(), hex(l.to_bytes()).into())).collect())
+            .unwrap_or_default();
+        let mut k_of: BTreeMap<[u8; 33], u32> = BTreeMap::new();
+        let outs: Vec<_> = outputs
+            .iter()
+            .zip(&tx.output)
+            .enumerate()
+            .map(|(i, (o, txo))| {
+                let (recipient, k) = match &o.dest {
+                    ApprovedDest::Sp { scan_key, spend_key } => {
+                        let k = k_of.entry(scan_key.serialize()).or_insert(0);
+                        *k += 1;
+                        let r = json!({
+                            "scan_key": hex(scan_key.serialize()),
+                            "spend_key": hex(spend_key.serialize()),
+                            "own_wallet": scan_key.serialize() == own,
+                        });
+                        (r, Some(*k - 1))
+                    }
+                    ApprovedDest::Script(s) => (json!({ "script": hex(s.as_bytes()) }), None),
+                };
+                json!({
+                    "index": i,
+                    "recipient": recipient,
+                    "k": k,
+                    "amount_sats": o.amount.to_sat(),
+                    "script_pubkey": hex(txo.script_pubkey.as_bytes()),
+                })
+            })
+            .collect();
+        crate::trace::emit(
+            "send.build_tx",
+            json!({
+                "inputs": resolved.iter().map(|r| r.outpoint.to_string()).collect::<Vec<_>>(),
+                "g": resolved.iter().map(|r| r.g).collect::<Vec<_>>(),
+                "sum_g": ctx.sum_g,
+                "input_key_sum_a": from_k(&ctx.a_point).ok().map(|a| hex(a.serialize())),
+                "input_hash": hex(ctx.input_hash.to_bytes()),
+                "signing_set": signing_set.iter().map(id_u16).collect::<Vec<_>>(),
+                "lagrange_lambda": lambdas,
+                // input_hash * a * B_scan per recipient scan key: the shared secret. Test only.
+                "combined_ecdh_point_test_only": ecdh.iter().map(|(scan_key, p)| json!({
+                    "scan_key": hex(scan_key),
+                    "point": hex(p.serialize()),
+                    "from": if *scan_key == own { "own b_scan (b_scan*A)" } else { "threshold shares (sum lambda_i*D_i)" },
+                })).collect::<Vec<_>>(),
+                "outputs": outs,
+                "txid": tx.compute_txid().to_string(),
+            }),
+        );
     }
 
     /// One signing package per input; the message is that input's sighash.
@@ -1037,12 +1191,54 @@ impl SendCoordinator {
             let sig = schnorr::Signature::from_slice(&sig.serialize()?)?;
             let xonly = XOnlyPublicKey::from_slice(&r.txout.script_pubkey.as_bytes()[2..])?;
             let msg = Message::from_digest_slice(packages[j].message())?;
-            Secp256k1::verification_only().verify_schnorr(&sig, &msg, &xonly)?;
+            let verified = Secp256k1::verification_only().verify_schnorr(&sig, &msg, &xonly);
+            if crate::trace::enabled() {
+                use crate::trace::hex;
+                // Public nonce commitments only; the nonces never leave the signers.
+                let commitments: serde_json::Map<String, serde_json::Value> = packages[j]
+                    .signing_commitments()
+                    .iter()
+                    .map(|(id, c)| {
+                        let h = c.hiding().serialize().ok().map(hex);
+                        let b = c.binding().serialize().ok().map(hex);
+                        (id_u16(id).unwrap_or_default().to_string(), serde_json::json!({ "hiding": h, "binding": b }))
+                    })
+                    .collect();
+                let sig_shares: serde_json::Map<String, serde_json::Value> = per
+                    .iter()
+                    .map(|(id, s)| (id_u16(id).unwrap_or_default().to_string(), hex(s.serialize()).into()))
+                    .collect();
+                crate::trace::emit(
+                    "send.input_signature",
+                    serde_json::json!({
+                        "input": j,
+                        "outpoint": r.outpoint.to_string(),
+                        "p_k_xonly": hex(xonly.serialize()),
+                        "message_sighash": hex(packages[j].message()),
+                        "nonce_commitments": commitments,
+                        "signature_shares": sig_shares,
+                        "signature": hex(sig.serialize()),
+                        "verifies_under_p_k": verified.is_ok(),
+                    }),
+                );
+            }
+            verified?;
             let mut w = Witness::new();
             w.push(sig.as_ref());
             signed.input[j].witness = w;
         }
-        verify_consensus_all(&signed, &prevouts)?;
+        let consensus = verify_consensus_all(&signed, &prevouts);
+        if crate::trace::enabled() {
+            crate::trace::emit(
+                "send.final",
+                serde_json::json!({
+                    "txid": signed.compute_txid().to_string(),
+                    "tx_hex": crate::trace::hex(bitcoin::consensus::serialize(&signed)),
+                    "consensus_valid": consensus.is_ok(),
+                }),
+            );
+        }
+        consensus?;
         Ok(signed)
     }
 }
@@ -1231,7 +1427,18 @@ pub fn plan_spend_exact(
             )));
         }
     }
-    check_parity_guard(&resolved.iter().map(|r| r.g).collect::<Vec<_>>())?;
+    let gs: Vec<i8> = resolved.iter().map(|r| r.g).collect();
+    let guard = check_parity_guard(&gs);
+    crate::trace::emit(
+        "send.parity_guard",
+        serde_json::json!({
+            "inputs": resolved.iter().map(|r| r.outpoint.to_string()).collect::<Vec<_>>(),
+            "g": gs,
+            "sum_g": gs.iter().map(|g| i64::from(*g)).sum::<i64>(),
+            "decision": if guard.is_ok() { "pass" } else { "refused: sum of parities is 0 (privacy guard)" },
+        }),
+    );
+    guard?;
 
     // Monetary validation before anything is signed: positive amounts inside the monetary
     // range, and every sum and product checked (a wrapped sum would sign a negative output).

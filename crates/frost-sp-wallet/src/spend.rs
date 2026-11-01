@@ -174,9 +174,11 @@ impl Signer {
     }
 
     pub(crate) fn refusal(&self, reason: impl Into<String>) -> Error {
+        let reason = reason.into();
+        crate::trace::emit("signer.refused", serde_json::json!({ "device": self.name, "reason": reason }));
         Error::Refused {
             who: self.name.clone(),
-            reason: reason.into(),
+            reason,
         }
     }
 

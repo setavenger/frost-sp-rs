@@ -7,12 +7,14 @@
 //! * [`send`]: multi-input spends that pay SP addresses (threshold ECDH + DLEQ).
 //! * [`exposure`]: share-release counter and rotation threshold.
 //! * [`spend`]: signer/coordinator for spending one received output (single input).
+//! * [`trace`]: opt-in JSON-lines trace for demo runs (`FROST_SP_TRACE`).
 
 pub mod dkg;
 pub mod exposure;
 pub mod group;
 pub mod send;
 pub mod spend;
+pub mod trace;
 pub mod tweak;
 pub mod wallet;
 

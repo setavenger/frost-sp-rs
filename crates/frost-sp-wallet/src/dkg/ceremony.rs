@@ -221,6 +221,78 @@ pub fn keygen<R: RngCore + CryptoRng>(t: u16, n: u16, rng: &mut R) -> Result<Vec
         devices.into_iter().map(|d| Box::new(d) as Box<dyn Participant>).collect();
     let mut nonce = [0u8; 32];
     rng.fill_bytes(&mut nonce);
-    let outcome = Ceremony::new(params, seats)?.run(nonce);
+    let mut ceremony = Ceremony::new(params, seats)?;
+    let outcome = ceremony.run(nonce);
+    if crate::trace::enabled() {
+        trace_keygen(ceremony.params(), &outcome);
+    }
     outcome.results.into_values().collect()
+}
+
+/// `FROST_SP_TRACE`: the ceremony's public record. `B_scan` is the public scan key; no secret
+/// is read here.
+fn trace_keygen(params: &Params, outcome: &Outcome) {
+    use crate::trace::hex;
+    use serde_json::json;
+    let count = |r: Round| outcome.log.iter().filter(|m| m.round == r).count();
+    let keys = outcome.accepted();
+    let first = keys.first().copied();
+    let cert = first.map(DeviceKey::certificate);
+    let echo = cert.map(|c| super::view_hash(&c.session_id, &c.round1_packages));
+    let echoes_matching = outcome
+        .log
+        .iter()
+        .filter(|m| m.round == Round::Echo)
+        .filter(|m| super::wire::Envelope::decode(&m.bytes).is_ok_and(|e| Some(e.payload.as_slice()) == echo.as_ref().map(|h| &h[..])))
+        .count();
+    let shares: serde_json::Map<String, serde_json::Value> = first
+        .map(|k| {
+            k.public_key_package()
+                .verifying_shares()
+                .iter()
+                .filter_map(|(id, s)| Some((super::index_of(id).ok()?.to_string(), hex(s.serialize().ok()?).into())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let secp = secp256k1::Secp256k1::new();
+    let devices: Vec<_> = outcome
+        .results
+        .iter()
+        .map(|(id, r)| {
+            json!({
+                "identifier": id,
+                "host_pubkey": params.host(*id).map(|h| hex(h.serialize())),
+                "accepted": r.is_ok(),
+                "error": r.as_ref().err().map(ToString::to_string),
+                "certificate_valid": r.as_ref().is_ok_and(|k| k.verify().is_ok()),
+                "check_code": r.as_ref().ok().map(DeviceKey::check_code),
+            })
+        })
+        .collect();
+    crate::trace::emit(
+        "keygen.dkg",
+        json!({
+            "n": params.n(),
+            "t": params.t(),
+            "device_ids": params.ids().collect::<Vec<_>>(),
+            "host_pubkeys": params.hosts().iter().map(|h| hex(h.serialize())).collect::<Vec<_>>(),
+            "messages_per_round": {
+                "round1": count(Round::Round1),
+                "echo": count(Round::Echo),
+                "round2_sealed": count(Round::Round2),
+                "certify": count(Round::Certify),
+            },
+            "session_id": cert.map(|c| hex(c.session_id)),
+            "echo_digest": echo.map(hex),
+            "echo_messages_matching_digest": echoes_matching,
+            "all_devices_same_certificate": keys.windows(2).all(|w| w[0].certificate() == w[1].certificate()),
+            "verification_shares": shares,
+            "group_key": first.and_then(|k| k.b_spend().ok()).map(|x| hex(x.serialize())),
+            "b_scan_pub": first.map(|k| hex(k.b_scan().public_key(&secp).serialize())),
+            "transcript_hash": cert.map(|c| hex(c.transcript_hash)),
+            "certificate_signatures": cert.map(|c| c.signatures.len()),
+            "check_code": first.map(DeviceKey::check_code),
+            "devices": devices,
+        }),
+    );
 }
