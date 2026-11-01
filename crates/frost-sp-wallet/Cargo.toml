@@ -19,6 +19,7 @@ rust-dleq.workspace = true
 k256 = "0.13"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 secp256k1.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 silentpayments.workspace = true
 thiserror.workspace = true

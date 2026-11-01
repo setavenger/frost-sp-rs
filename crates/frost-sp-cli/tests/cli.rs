@@ -12,7 +12,9 @@ use std::process::{Command, Stdio};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
 use common::*;
+use frost_secp256k1_tr::keys::KeyPackage;
 use frost_sp_wallet::send::{resolve_input, verify_consensus_all, InputSource, SpendableCoin};
+use frost_sp_wallet::tweak::tweak_key_package;
 use frost_sp_wallet::wallet::SpWallet;
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -78,8 +80,16 @@ fn utxo(c: &SpendableCoin) -> Value {
 }
 
 fn run(args: &[&str], envs: &[(&str, String)], stdin: &str) -> (Value, bool) {
+    run_in(None, args, envs, stdin)
+}
+
+/// `run` with the signer's working directory set to `cwd`.
+fn run_in(cwd: Option<&Path>, args: &[&str], envs: &[(&str, String)], stdin: &str) -> (Value, bool) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_frost-sp-signer"));
     cmd.args(args).env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -502,5 +512,145 @@ fn reconstruct_test_secret_matches_the_group_key_and_only_for_seeded_groups() {
     assert!(ok);
     let (v, ok) = run(&["reconstruct-test-secret", "--state", &p(&dir, 1), "--state", &p(&dir, 2)], &[], "");
     assert!(!ok && v["error"].as_str().unwrap().contains("seeded test group"), "{v}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ------------------------------------------------------------------------------------------
+// FROST_SP_TRACE: the opt-in demo trace (W6)
+// ------------------------------------------------------------------------------------------
+
+/// The wallet of a keygen output directory (from device 1's file) and its signer environment.
+fn wallet_of(dir: &Path, labels: &[u32]) -> (SpWallet, Vec<(&'static str, String)>) {
+    let f = read_json(&p(dir, 1));
+    let scan = f["scan_secret"].as_str().unwrap().to_string();
+    let spend = f["spend_pubkey"].as_str().unwrap().to_string();
+    let mut w = SpWallet::new(
+        SecretKey::from_slice(&hex::decode(&scan).unwrap()).unwrap(),
+        PublicKey::from_slice(&hex::decode(&spend).unwrap()).unwrap(),
+        Network::Testnet,
+    )
+    .unwrap();
+    for m in labels {
+        w.add_label(*m).unwrap();
+    }
+    let labels = labels.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let env = vec![
+        ("BLINDBIT_SIGNER_NETWORK", "regtest".into()),
+        ("BLINDBIT_SIGNER_SCAN_SECRET", scan),
+        ("BLINDBIT_SIGNER_SPEND_PUBKEY", spend),
+        ("BLINDBIT_SIGNER_LABELS", labels),
+    ];
+    (w, env)
+}
+
+/// D6 on the trace: a fresh keygen and a spend by devices 2 and 3, two processes with
+/// `FROST_SP_TRACE` set, append their records to one file, and no secret appears in it (as
+/// lowercase hex, either sign): no signing share `x_i`, no tweaked share `x_i + tau_j`, no host
+/// secret, not `b_scan`, not the group secret `x` or `x + tau_j` (reconstructed here, in the
+/// test only). The FROST nonces never leave the signer process; `frost-sp-wallet/tests/trace.rs`
+/// checks them in process. `FROST_SP_TRACE_SAMPLE=<file>` keeps a copy of the trace.
+#[test]
+fn trace_records_keygen_and_a_spend_and_no_secret() {
+    let dir = scratch("trace");
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = dir.join("keys");
+    let trace = dir.join("trace.jsonl");
+    let on = ("FROST_SP_TRACE", trace.to_str().unwrap().to_string());
+    let (kg, ok) = run(&["keygen", "--n", "3", "--t", "2", "--out-dir", keys.to_str().unwrap()], std::slice::from_ref(&on), "");
+    assert!(ok, "{kg}");
+    let (w, mut env) = wallet_of(&keys, &[7]);
+    env.push(on);
+    let cs = coins(&w, &[1, 1, -1], 4000); // sum g = 1
+    let req = request(&cs, &[(tsp(&SpdkReceiver::new(49).code()), 150_000)], &tsp(&w.change_address()));
+    let (v, ok) = run(&["--state", &p(&keys, 2), "--state", &p(&keys, 3)], &env, &req);
+    assert!(ok, "{v}");
+    if let Ok(keep) = std::env::var("FROST_SP_TRACE_SAMPLE") {
+        std::fs::copy(&trace, keep).unwrap();
+    }
+
+    let text = std::fs::read_to_string(&trace).unwrap();
+    let records: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let of = |step: &'static str| records.iter().filter(move |r| r["step"] == step).collect::<Vec<_>>();
+    let dkg = of("keygen.dkg");
+    assert_eq!(dkg.len(), 1);
+    assert_eq!(dkg[0]["messages_per_round"], json!({"round1": 6, "echo": 6, "round2_sealed": 6, "certify": 6}));
+    assert_eq!(dkg[0]["echo_messages_matching_digest"], json!(6));
+    assert!(dkg[0]["devices"].as_array().unwrap().iter().all(|d| d["certificate_valid"] == json!(true)));
+    assert_eq!(of("keygen.result")[0]["sp_address"], kg["sp_address"]);
+    assert_eq!(of("spend.request").len(), 1);
+    let inputs = of("spend.input");
+    assert_eq!(inputs.len(), 3);
+    for r in &inputs {
+        // re-derived and matching; the request's wrong tweak (11…11) is flagged, and ignored
+        assert_eq!(r["p_k_matches_script_pubkey"], json!(true), "{r}");
+        assert_eq!(r["handed_tweak_matches"], json!(false), "{r}");
+    }
+    assert_eq!(of("send.parity_guard")[0]["decision"], json!("pass"));
+    assert_eq!(of("send.ecdh_share").len(), 2, "one D_i per device for bob's scan key");
+    assert_eq!(of("send.signer_checks").len(), 2);
+    assert_eq!(of("send.build_tx").len(), 1);
+    let sigs = of("send.input_signature");
+    assert_eq!(sigs.len(), 3);
+    assert!(sigs.iter().all(|s| s["verifies_under_p_k"] == json!(true)));
+    let fin = of("send.final");
+    assert_eq!((fin.len(), &fin[0]["tx_hex"], &fin[0]["consensus_valid"]), (1, &v["tx_hex"], &json!(true)));
+
+    let taus: Vec<[u8; 32]> = cs.iter().map(|c| resolve_input(&w, &c.source).unwrap().tau).collect();
+    let mut secrets: Vec<(String, Vec<u8>)> = vec![];
+    let mut kps = vec![];
+    for i in 1..=3u16 {
+        let f = read_json(&p(&keys, i));
+        let kp = KeyPackage::deserialize(&hex::decode(f["key_package"].as_str().unwrap()).unwrap()).unwrap();
+        secrets.push((format!("signing share x_{i}"), kp.signing_share().serialize()));
+        for (j, tau) in taus.iter().enumerate() {
+            let tweaked = tweak_key_package(&kp, tau).unwrap();
+            secrets.push((format!("x_{i} + tau_{j}"), tweaked.signing_share().serialize()));
+        }
+        secrets.push((format!("host secret of {i}"), hex::decode(f["host_secret"].as_str().unwrap()).unwrap()));
+        if i == 1 {
+            secrets.push(("b_scan".into(), hex::decode(f["scan_secret"].as_str().unwrap()).unwrap()));
+        }
+        kps.push(kp);
+    }
+    let x = SecretKey::from_slice(&frost_secp256k1_tr::keys::reconstruct(&kps[..2]).unwrap().serialize()).unwrap();
+    assert_eq!(x.public_key(&secp256k1::Secp256k1::new()), *w.b_spend());
+    secrets.push(("group secret x".into(), x.secret_bytes().to_vec()));
+    for (j, tau) in taus.iter().enumerate() {
+        let xt = x.add_tweak(&secp256k1::Scalar::from_be_bytes(*tau).unwrap()).unwrap();
+        secrets.push((format!("x + tau_{j}"), xt.secret_bytes().to_vec()));
+    }
+    assert_eq!(secrets.len(), 3 * (1 + 3 + 1) + 1 + 1 + 3);
+    for (what, s) in &secrets {
+        let neg = SecretKey::from_slice(s).unwrap().negate().secret_bytes();
+        for (sign, bytes) in [("", s.as_slice()), ("-", neg.as_slice())] {
+            assert!(!text.contains(&hex::encode(bytes)), "{sign}{what} appears in the trace");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Without `FROST_SP_TRACE` (unset, or set but empty) keygen and a spend write no file: the
+/// signer's working directory stays empty and nothing appears beside the device files.
+#[test]
+fn without_frost_sp_trace_no_file_is_written() {
+    let dir = scratch("trace-off");
+    let cwd = dir.join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let keys = dir.join("keys");
+    let (v, ok) = run_in(Some(&cwd), &["keygen", "--n", "3", "--t", "2", "--out-dir", keys.to_str().unwrap()], &[], "");
+    assert!(ok, "{v}");
+    let (w, mut env) = wallet_of(&keys, &[]);
+    let cs = coins(&w, &[1], 4200);
+    let req = request(&cs, &[(tsp(&SpdkReceiver::new(50).code()), 50_000)], &tsp(&w.change_address()));
+    let (k1, k2) = (p(&keys, 1), p(&keys, 2));
+    let state = ["--state", k1.as_str(), "--state", k2.as_str()];
+    let (v, ok) = run_in(Some(&cwd), &state, &env, &req);
+    assert!(ok, "{v}");
+    env.push(("FROST_SP_TRACE", String::new()));
+    let (v, ok) = run_in(Some(&cwd), &state, &env, &req);
+    assert!(ok, "{v}");
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0, "a file appeared in the working directory");
+    assert_eq!(std::fs::read_dir(&keys).unwrap().count(), 3, "only the device files");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "only cwd/ and keys/");
     std::fs::remove_dir_all(dir).unwrap();
 }

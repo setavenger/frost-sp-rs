@@ -22,6 +22,7 @@ use frost_sp_wallet::send::{
     SpendableCoin,
 };
 use frost_sp_wallet::spend::Signer;
+use frost_sp_wallet::trace;
 use frost_sp_wallet::wallet::SpWallet;
 use rand::rngs::{OsRng, StdRng};
 use rand::{CryptoRng, RngCore, SeedableRng};
@@ -252,6 +253,25 @@ pub fn run_keygen(
         scan_secret: seeded.then(|| hex::encode(first.b_scan().secret_bytes())),
         devices,
     };
+    // FROST_SP_TRACE: the public result (the DKG itself is traced by `keygen`). Never `out`
+    // whole: a seeded run carries the scan secret.
+    trace::emit(
+        "keygen.result",
+        serde_json::json!({
+            "network": network,
+            "seeded_test_only": seeded,
+            "sp_address": out.sp_address,
+            "spend_pubkey": out.spend_pubkey,
+            "b_scan_pub": hex::encode(first.b_scan().public_key(&secp256k1::Secp256k1::new()).serialize()),
+            "check_code": out.check_code,
+            "devices": out.devices.iter().map(|d| serde_json::json!({
+                "identifier": d.identifier,
+                "file": d.file,
+                "check_code": d.check_code,
+                "sp_address": d.sp_address,
+            })).collect::<Vec<_>>(),
+        }),
+    );
     Ok((files, out))
 }
 
@@ -361,10 +381,9 @@ pub struct Utxo {
     pub funding_tx_hex: String,
     #[serde(default)]
     pub funding_prevouts: Vec<Prevout>,
-    /// Informational only. Never used: every signer re-derives the tweak from the funding
-    /// transaction with its own `b_scan`.
+    /// Informational only. Never used for signing: every signer re-derives the tweak from the
+    /// funding transaction with its own `b_scan`. `FROST_SP_TRACE` records whether it matches.
     #[serde(default)]
-    #[allow(dead_code)]
     pub tweak: String,
 }
 
@@ -468,10 +487,31 @@ pub fn sign_request<R: RngCore + CryptoRng>(
         signers.push(signer);
     }
 
+    trace::emit(
+        "spend.request",
+        serde_json::json!({
+            "network": request.network,
+            "fee_rate_sat_vb": request.fee_rate_sat_vb,
+            "destinations": request.destinations.iter()
+                .map(|d| serde_json::json!({ "address": d.address, "amount_sats": d.amount_sats }))
+                .collect::<Vec<_>>(),
+            "change_address": request.change_address,
+            "utxos": request.utxos.len(),
+            "devices": devices.iter().map(DeviceKey::identifier).collect::<Vec<_>>(),
+            "labels": env.labels,
+        }),
+    );
+
     // Coins.
     let mut coins = vec![];
     for u in &request.utxos {
-        coins.push(parse_coin(u)?);
+        let coin = parse_coin(u)?;
+        if trace::enabled() {
+            // The handed tweak is only compared, for the trace; signers re-derive their own.
+            let handed = Some(u.tweak.as_str()).filter(|t| !t.is_empty());
+            frost_sp_wallet::send::trace_input(coordinator.wallet(), &coin.source, handed);
+        }
+        coins.push(coin);
     }
 
     // Destinations and change.
